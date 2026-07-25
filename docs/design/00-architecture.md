@@ -106,10 +106,10 @@ From `docs/analysis/02-plane-assignment.md`: 279 in-scope operations.
 | **Transcode — cacheable** | 4 | Subtitle/attachment extraction. Spawns ffmpeg but output is short and content-addressed. No affinity. Scales independently. |
 
 The two-way split of the transcode plane is a real decision, not cosmetics: pinned and cacheable
-have different scaling laws and different affinity needs, so they are different Deployments. The
-pinned plane's shape — GPU node pool, hardware-acceleration type, scratch size, and the
-active-encode autoscaling envelope — is itself admin desired-state, declared by a `TranscodePool`
-CRD the reconciler materializes (§6).
+have different scaling laws and different affinity needs. The pinned plane's *substrate* — GPU node
+pool, hardware-acceleration type, per-session scratch template, and warm-capacity envelope — is
+admin desired-state, declared by a `TranscodePool` CRD (§6); each individual session runs in its own
+pod scheduled onto that pool (`TranscodeSession`, §5).
 
 ### Ingress routing: path-prefix on a single hostname
 
@@ -148,34 +148,34 @@ and it is fully enumerated in the analysis.
 
 ### Session affinity for segment requests
 
-**Decision: affinity keys on the `playSessionId` query parameter, enforced at the ingress via
-consistent hashing to transcode-plane pods, backed by a Postgres session→pod claim table as the
-authority.**
+**Decision: one pod per transcode session (§5's `TranscodeSession` model). The ingress routes on the
+`playSessionId` query parameter to that session's dedicated pod via an operator-maintained endpoint;
+there is no consistent hashing and no per-request claim-table lookup.**
 
-This is forced by the source. The in-process job registry (`TranscodeManager.cs:48`,
+The routing *key* is forced by the source. The in-process job registry (`TranscodeManager.cs:48`,
 `List<TranscodingJob>`) is keyed by `playlistPath` =
 `MD5(mediaPath + "-" + UserAgent + "-" + deviceId + "-" + playSessionId)`
 (`StreamingHelpers.cs:384`). The `playlistId` path segment is **not** the key — it is the constant
 string `main` (`DynamicHlsController.cs:1420`, parameter annotated `CA1801:ReviewUnusedParameters`
-at `:1090`). So affinity cannot key on the path segment. It must key on the query.
+at `:1090`). So affinity cannot key on the path segment; it must key on the query. Because
+`DynamicHlsPlaylistGenerator.cs:91-97` appends the whole original query string to every segment URI,
+`playSessionId` rides along on every segment request, and it is the coarsest key that keeps one
+session on one pod.
 
-Because `DynamicHlsPlaylistGenerator.cs:91-97` appends the whole original query string to every
-segment URI, `playSessionId` (and `deviceId`) ride along on every segment request. The ingress hashes
-`playSessionId` to pick a pod; the pod that first started the ffmpeg job writes a claim row
-`(playSessionId, podName, startedAt)` to Postgres. If consistent hashing routes a request to a pod
-that finds no local job but sees another pod's claim, it 307-redirects (or the ingress re-pins) to
-the claimant. The claim is the authority; the hash is the fast path.
+The *mechanism* is where the pod-per-session model (§5) simplifies things. When playback negotiation
+starts a transcode, the control plane mints a `TranscodeSession` CR; the operator reconciles it into
+one dedicated pod and publishes that pod as a stable per-session endpoint — the CNPG pattern, where
+the operator keeps a Service pointing at the cluster's current primary as pods move. The transcode
+ingress routes `playSessionId → that endpoint`. No hashing (the pod *is* the session, so there are no
+slots to rebalance) and no claim-table read per segment (the endpoint is the mapping, updated by the
+operator only when the pod is created or recreated, not per request). One session split across pods —
+the failure the old hashing-plus-claim design worked to prevent — is now structurally impossible: a
+session is a pod.
 
-Why not pure consistent hashing with no table: pod scale-down and rebalancing move hash slots, and a
-live session must not be silently torn from its ffmpeg process. The claim row survives a rehash and
-lets the new target find the true owner. Why not pure table lookup with no hash: a table lookup on
-every 2-second segment request is avoidable load; the hash gets it right without a query in steady
-state.
-
-The affinity key is `playSessionId` specifically, **not** the full MD5. The ingress cannot compute
-the MD5 (it would need `mediaPath` and `User-Agent`), but it does not need to: `playSessionId` is
-unique per play session and is the coarsest key that keeps one session on one pod. Two sessions that
-share a pod is fine; one session split across pods is the failure we prevent.
+This supersedes an earlier draft that hashed `playSessionId` to a shared transcode fleet and used a
+Postgres claim table as the tiebreak authority. That worked, but it existed only because a
+multi-tenant pod is not per-session addressable; making the pod the session removes the need for both
+the hash and the table (§5).
 
 ### Flagged for runtime experiment
 
@@ -362,9 +362,17 @@ From `docs/analysis/06-manager-coupling.md`:
 
 This is the crux of the whole architecture — the in-process job list is the single fact that makes
 Jellyfin unscalable (§0). To relocate it correctly we have to understand what `TranscodeManager`
-actually does, mechanism by mechanism, and then decide a home for each. The relocation rule is:
-**identity and coordination go to a Postgres claim row; live OS resources stay pod-local; the two
-planes coordinate only through the row, never by direct RPC.**
+actually does, mechanism by mechanism, and then decide a home for each.
+
+The model is the **CloudNativePG shape**. A `TranscodeSession` custom resource is the durable
+*shape* of one session; an operator reconciles it into **one dedicated pod** that holds every live
+mechanism. Just as a CNPG `Cluster` CR declares a database and is *not* rewritten when a row is
+inserted, the `TranscodeSession` CR declares a transcode and is *not* rewritten when a segment is
+produced or a keepalive ping arrives — all of that lives in the pod. The rule: **shape and lifecycle
+go in the CR (≈ two writes: create, delete); every high-frequency mechanism stays in the pod;
+nothing per-segment or per-ping ever touches etcd.** This supersedes an earlier draft that kept
+identity and keepalive in a Postgres claim row (§2); because one pod serves one session, the pod is
+directly addressable and the inner state never needs to leave it.
 
 #### How it works today (the monolith)
 
@@ -409,34 +417,75 @@ playhead. Both need the `Process` stdin and the scratch dir. Finally `ReportTran
 
 #### Relocation, per mechanism
 
+The dividing question for each mechanism is CNPG's: is this *shape/lifecycle* (→ the CR) or is it
+*the running workload* (→ the pod)? Almost everything is the workload.
+
 | Mechanism | Today | New home | Why |
 |:--|:--|:--|:--|
-| Job identity + lookup keys | fields in the in-process list | **`transcode_session` claim row** (Postgres), PK `play_session_id`, columns `device_id, live_stream_id, job_id, type, output_path, media_source_id` | Any pod, and the control plane, must resolve session → owning pod without touching process memory. This row *is* the affinity authority (§2). |
-| Job-creation mutex (`_transcodingLocks`, `:49`) | in-process keyed lock | **pod-local keyed lock** for the fast path, **`INSERT … ON CONFLICT (play_session_id)`** as the cross-pod backstop | Affinity pins one session to one pod, so same-session segment races contend the same in-process lock exactly as today; the unique claim only arbitrates the split-brain case where two pods both try to start ffmpeg. |
-| `Process`, `CancellationTokenSource`, throttler, segment cleaner, scratch dir (`:62,77,137,142`) | in-process | **pod-local only, never serialized** | OS handles and stdin pipes. This is *why* the transcode plane is pinned and its pods disposable. |
-| `ActiveRequestCount` (`:67`) | in-process refcount | **pod-local** | It counts in-flight requests *to this pod*; with affinity every request for a session lands here, so the count is correct locally and never needs sharing. |
-| Keepalive: `LastPingDate`/`PingTimeout`/`IsUserPaused` (`:147,152,92`) | in-process, pinged by `OnPlaybackProgress` | **claim-row columns** `last_ping_at, ping_timeout_ms, is_user_paused` | The progress report lands on the **control plane**, but the job lives on a **transcode pod**. The ping becomes an `UPDATE` of the row; the pod's kill timer and throttler read the row on their existing ticks. No plane-to-plane RPC — the row is the channel. |
-| Idle reaping (`OnTranscodeKillTimerStopped`, `:174`) | per-job in-process timer | **pod-local timer** (primary, frees the GPU promptly) **+ control-plane sweep** of rows whose owning pod's `pod_heartbeat_at` is stale | The in-process timer ports directly. The sweep is *new capability the monolith lacks*: it reaps jobs orphaned by a dead pod, which in-process state simply loses. |
-| Explicit stop (`DELETE /Videos/ActiveEncodings`) | `KillTranscodingJobs` over the list | **affinity-routed to the owning pod** → local `Process` kill → `DELETE` the row | The request carries `playSessionId`; ingress affinity (§2) delivers it to the owner, which holds every job for that session, so no fan-out is needed. |
-| Observed progress (`ReportTranscodingProgress`, `:323`) | pushed into `SessionManager` in-process | pod **writes progress columns to the claim row** every few seconds; control plane reads them for `GET /Sessions` | Replaces an in-process call with a low-frequency `UPDATE`/`SELECT`. |
-| Segment files | scratch dir | **pod-local scratch `PVC`**, GC'd by pod-local logic (`docs/analysis/05`), never a cluster `Job` | A cluster task deleting a live pod's scratch is the exact failure §5/analysis warns against. |
+| Session shape + identity (`playSessionId`, `deviceId`, item/`mediaSource`, resolved argv, hwaccel class, output container) | fields in the in-process list | **`TranscodeSession` CR `spec`**, minted by the control plane at playback start, written once | This is the durable *shape* the operator reconciles — the CNPG `Cluster` object. It survives pod crashes and is the session's identity. |
+| The running job itself | an entry in `_activeTranscodingJobs` | **one dedicated pod** the operator materializes from the CR (+ its scratch `PVC`) | CNPG `Cluster` → `StatefulSet` + `PVC`; here CR → pod. The pod *is* the session. |
+| `Process`, `CancellationTokenSource`, throttler, segment cleaner, scratch dir (`:62,77,137,142`) | in-process | **pod-local, in the session's pod** | OS handles and stdin pipes — the "rows," not the "shape." Never serialized, never in etcd. |
+| `ActiveRequestCount` (`:67`) | in-process refcount | **pod-local, in-memory** | The pod is dedicated to one session, so its local count *is* the session's count. Nothing to share. |
+| Keepalive `LastPingDate`/`PingTimeout`/`IsUserPaused` (`:147,152,92`) | in-process, pinged by `OnPlaybackProgress` | **pod-local, in-memory** — the ping is affinity-routed straight to the session's pod (§2), exactly like a segment request | This is the change the pod-per-session model buys: the pod is directly addressable, so the ping reaches it and updates in-memory state as in the monolith. No claim row, no etcd write, no plane-to-plane RPC. |
+| Idle reaping (`OnTranscodeKillTimerStopped`, `:174`) | per-job in-process timer | **pod-local timer; the pod exits when idle** | The reaper ports verbatim and manifests to Kubernetes as a graceful pod exit, which the operator turns into a CR delete. The control plane never computes liveness. |
+| Explicit stop (`DELETE /Videos/ActiveEncodings`) | `KillTranscodingJobs` over the list | affinity-routed to the session's pod → `SIGTERM` ffmpeg → exit (or control plane deletes the CR → `ownerReference`/`preStop` kills the pod) | The request carries `playSessionId`; it reaches the one pod that is the session. |
+| Observed progress (`ReportTranscodingProgress`, `:323`) | pushed into `SessionManager` in-process | **stays in the pod, exposed on a status endpoint**; `GET /Sessions` reads it on-demand from the pod | Querying the DB for its state, not mirroring every metric into the `Cluster` CR. Keeps progress out of both etcd and Postgres. |
+| Segment files | scratch dir | **pod-local scratch `PVC`, dies with the pod** | Pod == session, so when the session ends the scratch is gone with it — no cross-pod GC, no cluster `Job` deleting a live pod's dir. |
+| Session → pod routing (affinity, §2) | not applicable (one process) | **operator-maintained endpoint** (the CNPG `-rw` Service analog), rewritten only when the pod is created/recreated | The single low-write mapping the ingress reads; not a per-request table. |
 
-The net: the `transcode_session` row carries **identity + keepalive + observed progress** (all
-low-frequency, all serializable); everything with an OS handle stays pod-local; and every
-cross-plane action — create, ping, pause, stop, reap, report — is a read or write of that one row,
-so the planes never call each other directly.
+The net: the CR holds **shape + lifecycle only** (create and delete — two writes); the pod holds
+**every mechanism** (process, refcount, keepalive, throttle, progress, scratch); pings and segments
+and progress **never leave the pod**; and the only externally visible low-write facts are the CR's
+existence and its endpoint. etcd sees ≈ two writes per session; Postgres is out of the transcode hot
+path entirely. `TranscodeSession` is also the one CR the *control plane* mints at runtime rather than
+an admin declaring it — the `CertificateRequest` to the other CRDs' `Certificate`s (see §6).
+
+#### The operator is a dumb shape-reconciler
+
+Because all the mechanics live in the pod, the controller does nothing but ensure a pod exists,
+recover from crashes, and clean up on graceful exit — exactly a CNPG-style reconcile-shape-and-recover
+loop, never a liveness poller:
+
+```go
+func (r *Reconciler) Reconcile(ctx, req) (Result, error) {
+    ts, err := r.Get(...)
+    if apierrors.IsNotFound(err)      { return Result{}, nil }   // GC'd
+    if !ts.DeletionTimestamp.IsZero() { return Result{}, nil }   // ownerRef/preStop kills the pod
+
+    switch pod := r.podFor(ts); {
+    case pod == nil:          r.Create(ownedPod(ts))   // materialize one pod from the shape
+    case pod.idleExited():    r.Delete(ctx, ts)        // pod signalled "session over" -> delete CR
+    case pod.crashed():       r.Delete(ctx, pod)       // recreate next loop; CR (identity) survives
+    default:                  /* Running: nothing to do — the pod owns everything */
+    }
+    return Result{}, nil
+}
+```
 
 #### Crash and takeover
 
-A transcode pod that dies loses its `Process` objects but not its claim rows. Two things converge to
-recover: the control-plane sweep reclaims rows with a stale `pod_heartbeat_at`, and the client's next
-segment request is affinity-routed to a surviving pod that finds a claim but no local job. The
-monolith already tolerates exactly this — `GetDynamicSegment` restarts transcoding whenever
-`currentTranscodingIndex` is null or the requested segment is too far from it
-(`DynamicHlsController.cs:1478-1519`) — so the new owner restarts ffmpeg from the requested segment
-and updates the row's `pod_name`. Pod-local GC on boot clears any half-written segments the dead pod
-left behind. This is strictly better than the monolith, which on restart loses every in-flight job
-and relies solely on a startup file sweep.
+A pod that dies loses its `Process` objects but not its CR — the CR is the durable identity, exactly
+as a CNPG instance pod is disposable over a durable cluster object. The operator sees the pod gone and
+recreates it for the still-live CR; the new pod restarts ffmpeg from the requested segment, which the
+monolith already tolerates (`GetDynamicSegment` restarts whenever `currentTranscodingIndex` is null or
+the requested segment is too far from it, `DynamicHlsController.cs:1478-1519`). The client, meanwhile,
+is routing to the same operator-maintained endpoint, which now points at the new pod. Graceful idle is
+the mirror image: the pod's own reaper ends ffmpeg, the pod exits 0, and the operator deletes the CR.
+This is strictly better than the monolith, which loses every in-flight job on restart.
+
+#### The one place the CNPG analogy strains: cardinality
+
+CNPG clusters are *tens* of objects living for *months*; transcode sessions are *thousands* living
+for *minutes*. Each individual CR is still low-write (create + delete — that is what keeps etcd safe),
+but the *object churn* — create/delete rate and total count — stresses a dimension CNPG never
+exercises. The saving grace is physical: concurrent transcodes are hard-capped by **GPU encode slots**
+(NVENC/VAAPI session limits), so live-CR count is bounded by encode capacity — hundreds to low
+thousands per cluster, not millions — which keeps per-session CRs tenable. This is the thing to
+load-test before committing; if the churn proves too high, the fallback is to move the CR up a level
+(the long-lived object is the `TranscodePool`, and sessions become bare pods tracked in a registry,
+with no per-session CR). Separately, a fresh pod per session adds schedule + container-start latency to
+first-segment TTFB; mitigate with a **warm pool** of pre-started pods that are assigned to a session
+on demand rather than cold-started.
 
 ---
 
@@ -516,8 +565,11 @@ The last refinement generalized the reconciler's output: a CRD need not project 
 with that as an explicit second question — *is there admin desired-state that should become a K8s
 workload?* — surfaces one resource the first passes missed (`TranscodePool`) alongside the task
 pair. Applying the full lens yields **seven core custom resources across the reconciler's two output
-modes**, plus two optional admin-side templates and four candidates the lens rejects (both recorded
-below).
+modes**, plus two optional admin-side templates and four candidates the lens rejects (all recorded
+below). An **eighth CR is different in kind**: `TranscodeSession` (§5) is minted by the *control
+plane* at playback time, not declared by an admin — the runtime-workload analog of these config
+objects, a `CertificateRequest` to their `Certificate`s. It is listed here for completeness but its
+design lives in §5.
 
 | Entity | Admin-owned declarative half | Home |
 |:--|:--|:--|
@@ -528,9 +580,10 @@ below).
 | Recurring task | task type, target, trigger, concurrency | **`ScheduledTask`** CRD → `CronJob`/`Job` |
 | Ad-hoc task run | task type, target | **`TaskRun`** CRD → `Job` |
 | Transcode capacity | hwaccel pool, node placement, scratch, autoscale | **`TranscodePool`** CRD → `Deployment`/HPA/PDB/PVC |
+| Transcode session (runtime) | n/a — control-plane-minted, not admin-declared | **`TranscodeSession`** CR → one pod (§5) |
 | Items / media sources / streams | none — scanner-discovered | Postgres |
 | Playback & user data (`user_item_data`) | none — primary high-write | Postgres |
-| Sessions, live-stream handles, transcode claims | none — runtime | Postgres |
+| Playback sessions, live-stream handles | none — runtime, no declarative half | Postgres |
 | Devices + capabilities | none — self-register, client-posted | Postgres |
 | Playlists, collections | none — user-created content | Postgres |
 
@@ -653,8 +706,10 @@ status:
 - **Playback & user data** (`user_item_data`) — primary, high-write (a progress ping every few
   seconds per stream), must be queried for resume/next-up. The `User` CR's `status` summarizes it;
   it cannot live in etcd.
-- **Sessions, live-stream handles, transcode claims** — ephemeral, per-connection runtime with no
-  declarative half.
+- **Playback sessions, live-stream handles** — ephemeral, per-connection runtime with no declarative
+  half. (The *transcode* session is the exception the CNPG shape carves out — it becomes a
+  `TranscodeSession` CR whose pod holds all the runtime state; see §5. Its identity is durable enough
+  to be a CR; its inner state still never touches etcd.)
 - **Devices & capabilities** — self-register at runtime, high-cardinality, client-posted. (Admin
   policy over a device — enable/block — is thin; if it grows it attaches to the owning `User`, not
   a `Device` CR of its own.)
@@ -729,11 +784,10 @@ and trickplay images, subtitle/segment extraction); pod-local GC is not a CRD.
 
 ### Transcode capacity: `TranscodePool`, the workload the lens catches
 
-The workload output mode is not just for one-shot `Job`s — it is the natural home for the transcode
-plane itself. The plane's *shape* is admin desired-state: which GPU node pool, which
-`HardwareAccelerationType`, how much scratch, and the autoscaling envelope. The first passes treated
-this as a Helm-templated `Deployment` and missed that it is the same pattern as `ScheduledTask` — a
-domain CR the reconciler materializes into Kubernetes workload objects.
+The workload output mode is the natural home for the transcode plane's *substrate*. The plane's
+shape is admin desired-state: which GPU node pool, which `HardwareAccelerationType`, the per-session
+scratch template, and how much warm capacity to keep ready. `TranscodePool` is that declaration; the
+per-session `TranscodeSession` pods (§5) are *scheduled onto* it.
 
 ```yaml
 apiVersion: jellyfin.io/v1alpha1
@@ -742,27 +796,25 @@ metadata: { name: nvidia }
 spec:
   hardwareAccelerationType: nvenc      # must be in JellyfinServer.spec's allowed set
   nodeSelector: { gpu: nvidia }
-  scratch: { size: 100Gi, storageClass: fast-local }
-  autoscale:
-    metric: activeEncodesPerPod        # sourced from the transcode_session claim table (§2)
-    target: 4
-    minReplicas: 0                     # scale-to-zero when no encodes (the §0 premise)
-    maxReplicas: 12
+  scratch: { size: 100Gi, storageClass: fast-local }   # per-session PVC template
+  warmPool: 2                          # pre-started idle pods that hide cold-start TTFB (§5)
+  maxConcurrentSessions: 12            # the GPU encode-slot cap; bounds live TranscodeSession pods
 status:
-  readyReplicas: 2
-  activeEncodes: 7                      # observed from the claim table; the §8 ethos applied to capacity
+  readyWarmPods: 2
+  activeSessions: 7                     # count of live TranscodeSession pods in this pool
   conditions: [...]                     # e.g. hwaccel not available on matched nodes
 ```
 
-The reconciler materializes a `Deployment` (image, `nodeSelector`, GPU resource requests), a
-KEDA `ScaledObject`/HPA on the domain metric, a `PodDisruptionBudget`, and the scratch `PVC`
-template. Three wins over a bare Helm `Deployment` + HPA: the autoscaler is keyed on the domain
-signal (active encodes from the §2 claim table, not CPU); `spec.hardwareAccelerationType` is
-validated against `JellyfinServer`'s allowed set with the mismatch surfaced in `status`; and one CR
-per pool expresses **heterogeneous** clusters (an `nvenc` pool and a `vaapi` pool with different
-node selectors and envelopes) cleanly. Honest caveat: for a single homogeneous pool this collapses
-to a templated `Deployment` + HPA, and the CRD earns its keep only with heterogeneity or
-domain-metric autoscaling — but both are core to the premise (§0), so it is worth it here.
+The reconciler maintains the warm pool (a small `Deployment` of idle, pre-started pods a new session
+is promoted from instead of cold-starting), enforces `maxConcurrentSessions` against GPU encode
+slots, and lets pending session pods drive node autoscaling (cluster-autoscaler / Karpenter). Three
+wins over a bare Helm chart: `spec.hardwareAccelerationType` is validated against `JellyfinServer`'s
+allowed set with the mismatch surfaced in `status`; the warm-pool buffer is the concrete cold-start
+mitigation §5 calls for; and one CR per pool expresses **heterogeneous** clusters (an `nvenc` pool
+and a `vaapi` pool with different node selectors and caps) cleanly. This replaces an earlier framing
+in which `TranscodePool` was a `Deployment` of multi-tenant workers autoscaled on encodes-per-pod;
+the pod-per-session model (§5) makes it a capacity substrate instead, and encodes-per-pod is always
+one.
 
 ### Optional admin-side templates (wire-invisible)
 
@@ -801,7 +853,8 @@ workloads the other CRDs materialize — `CronJob`/`Job` for `ScheduledTask`/`Ta
 garbage-collected with its CR. The server owns every `status` subresource and all runtime tables.
 That keeps one source of truth per field: the API serves spec-derived data read-only, the
 reconciler never touches runtime data, and no workload is hand-managed with `kubectl apply`.
-Building it is Phase 5 work (§7).
+The eighth CR, the control-plane-minted `TranscodeSession`, is driven by its own dumb shape-reconciler
+(§5), separate from this config reconciler. Building both is Phase 5 work (§7).
 
 ---
 
@@ -863,14 +916,16 @@ normalized diff.
 
 ### Phase 5 — Kubernetes operationalization
 
-The seven CRDs and their reconciler (§6) — four config/identity resources plus the `ScheduledTask` /
-`TaskRun` / `TranscodePool` workload trio (`docs/analysis/05`) — scale-to-zero / hibernation of the
-control plane (and of `TranscodePool` at `minReplicas: 0`), transcode-pod disposal and
+The seven config CRDs and their reconciler (§6) — four config/identity resources plus the
+`ScheduledTask` / `TaskRun` / `TranscodePool` workload trio (`docs/analysis/05`) — plus the
+control-plane-minted `TranscodeSession` CR and its shape-reconciler (§5); scale-to-zero / hibernation
+of the control plane (and of `TranscodePool` at `minReplicas: 0`), transcode-pod disposal and
 reconciliation, and pod-local GC for transcode scratch.
 
 **Gate:** Control plane scales 0→N→0 with a captured session surviving a cold start; a transcode pod
-killed mid-session is either reconciled (session resumes) or fails cleanly to a client-visible
-restart that the oracle also exhibits under equivalent process death.
+killed mid-session is reconciled — the operator recreates the session's pod, which resumes from the
+requested segment (§5) — or fails cleanly to a client-visible restart that the oracle also exhibits
+under equivalent process death.
 
 ---
 
