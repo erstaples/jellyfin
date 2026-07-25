@@ -360,18 +360,83 @@ From `docs/analysis/06-manager-coupling.md`:
 
 ### Where transcode session state lives
 
-Split by serializability:
+This is the crux of the whole architecture — the in-process job list is the single fact that makes
+Jellyfin unscalable (§0). To relocate it correctly we have to understand what `TranscodeManager`
+actually does, mechanism by mechanism, and then decide a home for each. The relocation rule is:
+**identity and coordination go to a Postgres claim row; live OS resources stay pod-local; the two
+planes coordinate only through the row, never by direct RPC.**
 
-| State | Home |
-|:--|:--|
-| ffmpeg `Process` handle, scratch dir, `TranscodingThrottler`, `TranscodingSegmentCleaner` (`TranscodingJob.cs:62,137,142`) | **Pod-local only.** Inherently non-serializable. This is why transcode pods are pinned and disposable. |
-| Session→pod claim, `PlaySessionId`, `DeviceId`, job identity (the MD5 inputs), `ActiveRequestCount`, `LastPingDate` | `transcode_session` table (Postgres). The claim that makes affinity (§2) work. |
-| Segment files on disk | Pod-local scratch volume. GC'd by pod-local logic (`docs/analysis/05-scheduled-tasks.md`), never a cluster CronJob. |
+#### How it works today (the monolith)
 
-A transcode pod that restarts loses the `Process` but not the claim row; on boot it reconciles —
-either resumes ownership by restarting ffmpeg from the requested segment (the C# server already
-tolerates this; `GetDynamicSegment` restarts transcoding when the segment gap is too large,
-`DynamicHlsController.cs:1500-1520`) or releases the claim.
+`TranscodeManager` (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs`) holds
+`List<TranscodingJob> _activeTranscodingJobs` (`:48`) under a plain `lock`, plus an
+`AsyncKeyedLocker<string>` keyed by output path (`:49`). A `TranscodingJob`
+(`MediaBrowser.Controller/MediaEncoding/TranscodingJob.cs`) bundles three kinds of thing that the
+monolith conflates and we must separate:
+
+1. **Identity / lookup keys** — `PlaySessionId` (`:32`), `DeviceId` (`:72`), `LiveStreamId` (`:37`),
+   `Id` (`:97`), `Type` (`:57`), `Path` (`:52`, the `MD5(mediaPath+UA+deviceId+playSessionId)`
+   playlist path from §2), `MediaSource` (`:47`). Two lookup paths exist: by `playSessionId`
+   (`GetTranscodingJob`, `:100`) and by `(path, type)` (`OnTranscodeBeginRequest`, `:688`).
+2. **Live OS resources** — `Process` (`:62`, the ffmpeg handle), `CancellationTokenSource` (`:77`),
+   `TranscodingThrottler` (`:137`), `TranscodingSegmentCleaner` (`:142`), and the scratch dir the
+   segments are written to. None serializable.
+3. **Refcount / liveness / observed progress** — `ActiveRequestCount` (`:67`), `LastPingDate`
+   (`:147`), `PingTimeout` (`:152`), `IsUserPaused` (`:92`), `HasExited`/`ExitCode` (`:82`,`:87`),
+   and the progress fields `CompletionPercentage`/`Framerate`/`BytesTranscoded`/`BitRate`/
+   `TranscodingPositionTicks` (`:102`–`:127`).
+
+The **lifecycle**: `StartFfMpeg` (`:371`) → `AcquireResources` (`:663`, opens the live stream and
+buffers) → launches the `Process` → `OnTranscodeBeginning` (`:577`) creates the job with
+`ActiveRequestCount = 1` and adds it to the list. Each further segment request that finds a live job
+calls `OnTranscodeBeginRequest` (`:688`) to `++ActiveRequestCount` and cancel the kill timer;
+`OnTranscodeEndRequest` (`:613`) does `--ActiveRequestCount` and, at zero, arms it. Process exit runs
+`OnFfMpegProcessExited` (`:641`).
+
+The **reaper** is the subtle part. HLS has no persistent connection — every segment is a separate
+GET — so idle jobs are reaped by a keepalive timer, not by a closed socket. The client's playback
+progress report drives it: `OnPlaybackProgress` (`:710`) → `PingTranscodingJob` (`:118`) refreshes
+`LastPingDate` and re-arms a per-job kill timer (`PingTimer`, `:145`; 10 s progressive, 60 s HLS).
+`OnTranscodeKillTimerStopped` (`:174`) kills the job once `now - LastPingDate ≥ PingTimeout`. The
+explicit stop is `DELETE /Videos/ActiveEncodings` → `KillTranscodingJobs(deviceId, playSessionId)`
+(`HlsSegmentController.cs:103`, `TranscodeManager.cs:194`).
+
+Two **pod-local control loops** run per job: the `TranscodingThrottler` (`TranscodingThrottler.cs`)
+ticks every 5 s and writes `p`/`c` (pause) or `u`/newline (resume) to ffmpeg **stdin** to stop it
+racing too far ahead of the playhead; the `TranscodingSegmentCleaner` deletes segments behind the
+playhead. Both need the `Process` stdin and the scratch dir. Finally `ReportTranscodingProgress`
+(`:323`) pushes a `TranscodingInfo` into `SessionManager` so `GET /Sessions` can show encode state.
+
+#### Relocation, per mechanism
+
+| Mechanism | Today | New home | Why |
+|:--|:--|:--|:--|
+| Job identity + lookup keys | fields in the in-process list | **`transcode_session` claim row** (Postgres), PK `play_session_id`, columns `device_id, live_stream_id, job_id, type, output_path, media_source_id` | Any pod, and the control plane, must resolve session → owning pod without touching process memory. This row *is* the affinity authority (§2). |
+| Job-creation mutex (`_transcodingLocks`, `:49`) | in-process keyed lock | **pod-local keyed lock** for the fast path, **`INSERT … ON CONFLICT (play_session_id)`** as the cross-pod backstop | Affinity pins one session to one pod, so same-session segment races contend the same in-process lock exactly as today; the unique claim only arbitrates the split-brain case where two pods both try to start ffmpeg. |
+| `Process`, `CancellationTokenSource`, throttler, segment cleaner, scratch dir (`:62,77,137,142`) | in-process | **pod-local only, never serialized** | OS handles and stdin pipes. This is *why* the transcode plane is pinned and its pods disposable. |
+| `ActiveRequestCount` (`:67`) | in-process refcount | **pod-local** | It counts in-flight requests *to this pod*; with affinity every request for a session lands here, so the count is correct locally and never needs sharing. |
+| Keepalive: `LastPingDate`/`PingTimeout`/`IsUserPaused` (`:147,152,92`) | in-process, pinged by `OnPlaybackProgress` | **claim-row columns** `last_ping_at, ping_timeout_ms, is_user_paused` | The progress report lands on the **control plane**, but the job lives on a **transcode pod**. The ping becomes an `UPDATE` of the row; the pod's kill timer and throttler read the row on their existing ticks. No plane-to-plane RPC — the row is the channel. |
+| Idle reaping (`OnTranscodeKillTimerStopped`, `:174`) | per-job in-process timer | **pod-local timer** (primary, frees the GPU promptly) **+ control-plane sweep** of rows whose owning pod's `pod_heartbeat_at` is stale | The in-process timer ports directly. The sweep is *new capability the monolith lacks*: it reaps jobs orphaned by a dead pod, which in-process state simply loses. |
+| Explicit stop (`DELETE /Videos/ActiveEncodings`) | `KillTranscodingJobs` over the list | **affinity-routed to the owning pod** → local `Process` kill → `DELETE` the row | The request carries `playSessionId`; ingress affinity (§2) delivers it to the owner, which holds every job for that session, so no fan-out is needed. |
+| Observed progress (`ReportTranscodingProgress`, `:323`) | pushed into `SessionManager` in-process | pod **writes progress columns to the claim row** every few seconds; control plane reads them for `GET /Sessions` | Replaces an in-process call with a low-frequency `UPDATE`/`SELECT`. |
+| Segment files | scratch dir | **pod-local scratch `PVC`**, GC'd by pod-local logic (`docs/analysis/05`), never a cluster `Job` | A cluster task deleting a live pod's scratch is the exact failure §5/analysis warns against. |
+
+The net: the `transcode_session` row carries **identity + keepalive + observed progress** (all
+low-frequency, all serializable); everything with an OS handle stays pod-local; and every
+cross-plane action — create, ping, pause, stop, reap, report — is a read or write of that one row,
+so the planes never call each other directly.
+
+#### Crash and takeover
+
+A transcode pod that dies loses its `Process` objects but not its claim rows. Two things converge to
+recover: the control-plane sweep reclaims rows with a stale `pod_heartbeat_at`, and the client's next
+segment request is affinity-routed to a surviving pod that finds a claim but no local job. The
+monolith already tolerates exactly this — `GetDynamicSegment` restarts transcoding whenever
+`currentTranscodingIndex` is null or the requested segment is too far from it
+(`DynamicHlsController.cs:1478-1519`) — so the new owner restarts ffmpeg from the requested segment
+and updates the row's `pod_name`. Pod-local GC on boot clears any half-written segments the dead pod
+left behind. This is strictly better than the monolith, which on restart loses every in-flight job
+and relies solely on a startup file sweep.
 
 ---
 
