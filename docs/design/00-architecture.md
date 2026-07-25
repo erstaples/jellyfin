@@ -77,7 +77,7 @@ jellyfin-go/
   conformance/                # capture harness + replay runner (§3)
   differential/               # ffmpeg-argv diff harness (§4)
   fixtures/                   # golden captures, checked in, generated from oracle/
-  deploy/                     # K8s manifests, CRDs
+  deploy/                     # K8s manifests, CRD definitions + reconciler (§6)
   docs/
 ```
 
@@ -414,7 +414,89 @@ Not built, deliberately. Roughly a third of the API surface, 140 operations (the
   (filesystem browser), `BackupController`, `LibraryStructureController`,
   `ScheduledTasksController` (tasks are CronJobs managed by `kubectl`).
 
-Admin is CLI and/or CRDs. There is no web UI. Native clients are the only consumers.
+There is no web UI. Native clients are the only consumers. Admin is CLI and CRDs, specified next.
+
+### Admin surface: CRDs and CLI
+
+The dividing principle: **a CRD represents desired-state, admin-owned configuration that an
+operator reconciles; runtime state does not.** Anything an administrator declares once and expects
+the cluster to converge to — libraries, server settings — is a custom resource. Anything that is
+produced by the system at runtime — users logging in, sessions, watch state, tokens, transcode
+claims — stays in Postgres and is managed through the API and a CLI, never through a CRD. Passwords
+and playback history are not desired-state and must not live in etcd.
+
+That yields exactly **two custom resources**, plus native Kubernetes objects for the rest.
+
+**`MediaLibrary`** (namespaced). Replaces `LibraryStructureController` and the library-options half
+of `ConfigurationController`, both of which are out of scope as HTTP surfaces precisely because
+they become declarative. One CR per library. Spec shape:
+
+```yaml
+apiVersion: jellyfin.io/v1alpha1
+kind: MediaLibrary
+metadata: { name: movies }
+spec:
+  contentType: movies            # movies | tvshows | music | mixed
+  paths:
+    - /media/movies
+  metadata:
+    preferredLanguage: en
+    countryCode: US
+    providers: [tmdb, omdb]       # ordered; identity of providers, not their secrets
+  images:
+    enabled: true
+    providers: [tmdb, fanarttv]
+  trickplay:
+    enabled: true
+    hardwareAcceleration: false   # opt a library out of GPU trickplay generation
+  scanSchedule: "0 3 * * *"       # informs the RefreshLibrary CronJob for this library
+status:
+  lastScan: <timestamp>
+  itemCount: <int>
+  conditions: [...]               # standard K8s conditions; surfaces scan/reconcile errors
+```
+
+An operator reconciles a `MediaLibrary` into the `library` rows in Postgres and (re)configures the
+per-library scan CronJob (`docs/analysis/05-scheduled-tasks.md`). `status` is written back so
+`kubectl get medialibrary` shows real scan state. Provider **credentials** are referenced by
+`secretRef`, never inlined — the CR names which providers, a `Secret` holds their API keys.
+
+**`JellyfinServer`** (namespaced, singleton per instance). Replaces the server-wide half of
+`ConfigurationController`. Cluster-scoped-in-spirit settings that are not per-library: default
+transcode settings, hardware-acceleration policy (which `HardwareAccelerationType` the transcode
+plane may use, throttling, segment TTL), network exposure, and the analytics/observability sinks
+from §8. Its transcode block is the operator-facing knob that the transcode-plane pods read.
+
+```yaml
+apiVersion: jellyfin.io/v1alpha1
+kind: JellyfinServer
+metadata: { name: default }
+spec:
+  transcoding:
+    hardwareAccelerationType: nvenc        # maps to MediaBrowser.Model.Entities.HardwareAccelerationType
+    allowedCodecs: [h264, hevc, av1]
+    throttle: true
+    segmentTtlSeconds: 3600
+  playback:
+    defaultMaxStreamingBitrate: 120000000
+  observability:
+    decisionEventSink: otlp://...          # the playback-decision stream from §8
+```
+
+**Not CRDs, by the principle above:**
+
+- **Users** — runtime state (credentials, watch history, per-user policy). Managed by a
+  `jellyfinctl user` CLI against the control-plane API, backed by the `app_user` table (§5). The
+  first admin is bootstrapped from a `Secret` at install, not a CR.
+- **Scheduled tasks** — native `CronJob` objects (`docs/analysis/05`), managed with `kubectl`. A
+  custom resource would add nothing over the built-in.
+- **Server config that is pure key/value** with no reconciliation logic — could ride in a
+  `ConfigMap` the pods mount, but is folded into `JellyfinServer` above so there is a single
+  admin-facing object with a `status` and validation, rather than an unvalidated blob.
+
+The reconciler (a controller in `deploy/`) watches both CRDs and owns the write path into Postgres
+and the CronJob set. It is the *only* writer for library structure and server config; the API
+serves those as read-only, so there is one source of truth. Building it is Phase 5 work (§7).
 
 ---
 
@@ -477,7 +559,7 @@ normalized diff.
 ### Phase 5 — Kubernetes operationalization
 
 CronJobs (`docs/analysis/05`), scale-to-zero / hibernation of the control plane, transcode-pod
-disposal and reconciliation, CRDs for admin.
+disposal and reconciliation, the `MediaLibrary` / `JellyfinServer` CRDs and their reconciler (§6).
 
 **Gate:** Control plane scales 0→N→0 with a captured session surviving a cold start; a transcode pod
 killed mid-session is either reconciled (session resumes) or fails cleanly to a client-visible
