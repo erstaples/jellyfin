@@ -11,6 +11,8 @@
 
 ## TRANSCODE-PINNED
 
+The session-pinned transcode plane. Every route here either owns a live ffmpeg process for the duration of a play session or is bound to one: HLS playlists and segments, progressive `/stream` endpoints, and the encoding-management calls. Jobs are keyed by `MD5(mediaPath + UserAgent + deviceId + playSessionId)` and held in an in-process list (`TranscodeManager.cs:48`), so a request must reach the same pod that started its job. These pods live on GPU nodes, scale on active encode count, and are individually disposable. Most of this surface is invisible in the published OpenAPI spec, yet it is exactly what clients stream from.
+
 | Method | Route | Controller | In spec | Rationale |
 |:--|:--|:--|:-:|:--|
 | GET | `/Audio/{itemId}/stream` | Audio | yes | Progressive stream; may spawn ffmpeg for the response lifetime |
@@ -40,6 +42,8 @@
 
 ## TRANSCODE-CACHEABLE
 
+The stateless half of the transcode plane. These routes also spawn ffmpeg (subtitle extraction/conversion via `SubtitleEncoder.cs:871`, attachment extraction via `AttachmentExtractor.cs:190`), but the output is short, content-addressed, and safe to cache. Nothing is pinned for a session lifetime, so these pods need no affinity and scale independently of the pinned encoders.
+
 | Method | Route | Controller | In spec | Rationale |
 |:--|:--|:--|:-:|:--|
 | GET | `/Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8` | Subtitle | yes | Subtitle extract/convert spawns ffmpeg; output cacheable |
@@ -48,6 +52,8 @@
 | GET | `/Videos/{videoId}/{mediaSourceId}/Attachments/{index}` | VideoAttachments | yes | Attachment extraction spawns ffmpeg; output cacheable |
 
 ## OUT
+
+Out of scope. This is roughly a third of the API surface, dropped deliberately: the explicit non-goal features (LiveTv, SyncPlay, plugins, channels, lyrics, instant mix) and everything that exists only to serve jellyfin-web, which we do not host (dashboard, first-run wizard, branding CSS, web config surface, activity log, filesystem browser, backup, virtual-folder CRUD). Admin moves to CLI and CRDs; scheduled tasks become CronJobs managed by `kubectl` rather than this HTTP surface.
 
 | Method | Route | Controller | In spec | Rationale |
 |:--|:--|:--|:-:|:--|
@@ -193,6 +199,8 @@
 | GET | `/GetUtcTime` | TimeSync | yes | SyncPlay clock sync only - non-goal |
 
 ## CONTROL
+
+The control plane: decide, do not move bytes. Every route here is a DB read or write returning JSON, or a static-file read (images via Skia, trickplay tiles), with no long-lived per-request resource. This is the bulk of the surface — auth, item queries, user data, playstate, playback negotiation (`POST /Items/{itemId}/PlaybackInfo`, the plane boundary itself) — and it is stateless, scales 0→N, and hibernates.
 
 | Method | Route | Controller | In spec | Rationale |
 |:--|:--|:--|:-:|:--|
