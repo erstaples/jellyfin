@@ -106,7 +106,10 @@ From `docs/analysis/02-plane-assignment.md`: 279 in-scope operations.
 | **Transcode — cacheable** | 4 | Subtitle/attachment extraction. Spawns ffmpeg but output is short and content-addressed. No affinity. Scales independently. |
 
 The two-way split of the transcode plane is a real decision, not cosmetics: pinned and cacheable
-have different scaling laws and different affinity needs, so they are different Deployments.
+have different scaling laws and different affinity needs, so they are different Deployments. The
+pinned plane's shape — GPU node pool, hardware-acceleration type, scratch size, and the
+active-encode autoscaling envelope — is itself admin desired-state, declared by a `TranscodePool`
+CRD the reconciler materializes (§6).
 
 ### Ingress routing: path-prefix on a single hostname
 
@@ -443,11 +446,13 @@ runtime state is not disqualifying; you split it along the standard Kubernetes s
 A thing is **Postgres-only** when it has *no* meaningful declarative half: it self-registers at
 runtime, is high-cardinality and churning, or is primary content discovered rather than declared.
 
-Applying that lens yields **six custom resources across the reconciler's two output modes.** Four
-are *config/identity* CRDs the reconciler projects into Postgres rows and `Secret`s; two are *task*
-CRDs it materializes into Kubernetes `CronJob`/`Job` workloads (covered after the config four). Of
-the config four, two were already here; `User` and `ApiKey` fall out once the spec/status seam is
-applied to entities that carry both admin policy and runtime state.
+The last refinement generalized the reconciler's output: a CRD need not project into a Postgres row
+— it can **materialize a Kubernetes object** (`ScheduledTask` → `CronJob`). Re-scanning every model
+with that as an explicit second question — *is there admin desired-state that should become a K8s
+workload?* — surfaces one resource the first passes missed (`TranscodePool`) alongside the task
+pair. Applying the full lens yields **seven core custom resources across the reconciler's two output
+modes**, plus two optional admin-side templates and four candidates the lens rejects (both recorded
+below).
 
 | Entity | Admin-owned declarative half | Home |
 |:--|:--|:--|
@@ -457,6 +462,7 @@ applied to entities that carry both admin policy and runtime state.
 | API integration key | named integration, enablement | **`ApiKey`** CRD (spec) + `Secret` (token) |
 | Recurring task | task type, target, trigger, concurrency | **`ScheduledTask`** CRD → `CronJob`/`Job` |
 | Ad-hoc task run | task type, target | **`TaskRun`** CRD → `Job` |
+| Transcode capacity | hwaccel pool, node placement, scratch, autoscale | **`TranscodePool`** CRD → `Deployment`/HPA/PDB/PVC |
 | Items / media sources / streams | none — scanner-discovered | Postgres |
 | Playback & user data (`user_item_data`) | none — primary high-write | Postgres |
 | Sessions, live-stream handles, transcode claims | none — runtime | Postgres |
@@ -656,12 +662,80 @@ cluster-level `Job` deleting another live pod's scratch dir is exactly the failu
 warns against. `ScheduledTask` is for cluster-level work (library scan, people validation, chapter
 and trickplay images, subtitle/segment extraction); pod-local GC is not a CRD.
 
-The reconciler (a controller in `deploy/`) watches all six CRDs across its two output modes: it is
-the **sole writer** of the spec-derived Postgres columns (library structure, server config, user
-identity/policy, API-key identity) and their `Secret`s, *and* the owner of the `CronJob`/`Job`
-objects the task CRDs materialize. The server owns every `status` subresource and all runtime
-tables. That keeps one source of truth per field: the API serves spec-derived data read-only, the
-reconciler never touches runtime data, and no task workload is hand-managed with `kubectl apply`.
+### Transcode capacity: `TranscodePool`, the workload the lens catches
+
+The workload output mode is not just for one-shot `Job`s — it is the natural home for the transcode
+plane itself. The plane's *shape* is admin desired-state: which GPU node pool, which
+`HardwareAccelerationType`, how much scratch, and the autoscaling envelope. The first passes treated
+this as a Helm-templated `Deployment` and missed that it is the same pattern as `ScheduledTask` — a
+domain CR the reconciler materializes into Kubernetes workload objects.
+
+```yaml
+apiVersion: jellyfin.io/v1alpha1
+kind: TranscodePool
+metadata: { name: nvidia }
+spec:
+  hardwareAccelerationType: nvenc      # must be in JellyfinServer.spec's allowed set
+  nodeSelector: { gpu: nvidia }
+  scratch: { size: 100Gi, storageClass: fast-local }
+  autoscale:
+    metric: activeEncodesPerPod        # sourced from the transcode_session claim table (§2)
+    target: 4
+    minReplicas: 0                     # scale-to-zero when no encodes (the §0 premise)
+    maxReplicas: 12
+status:
+  readyReplicas: 2
+  activeEncodes: 7                      # observed from the claim table; the §8 ethos applied to capacity
+  conditions: [...]                     # e.g. hwaccel not available on matched nodes
+```
+
+The reconciler materializes a `Deployment` (image, `nodeSelector`, GPU resource requests), a
+KEDA `ScaledObject`/HPA on the domain metric, a `PodDisruptionBudget`, and the scratch `PVC`
+template. Three wins over a bare Helm `Deployment` + HPA: the autoscaler is keyed on the domain
+signal (active encodes from the §2 claim table, not CPU); `spec.hardwareAccelerationType` is
+validated against `JellyfinServer`'s allowed set with the mismatch surfaced in `status`; and one CR
+per pool expresses **heterogeneous** clusters (an `nvenc` pool and a `vaapi` pool with different
+node selectors and envelopes) cleanly. Honest caveat: for a single homogeneous pool this collapses
+to a templated `Deployment` + HPA, and the CRD earns its keep only with heterogeneity or
+domain-metric autoscaling — but both are core to the premise (§0), so it is worth it here.
+
+### Optional admin-side templates (wire-invisible)
+
+Two further CRDs are defensible as *conveniences* that expand into spec already defined above. Both
+are optional and neither changes the wire:
+
+- **`MetadataProvider`** — a shared provider registry (`type`, `secretRef`, rate limit, enable) that
+  `MediaLibrary` references by name, replacing per-library provider lists plus scattered `Secret`s
+  and giving each provider observable `status` (quota, last error). Worth it because credentials and
+  rate limits are server-wide, not per-library; skip it only when a deployment truly has one
+  provider.
+- **`Role`** — an admin-side policy template `User.spec.policy` may reference; the reconciler expands
+  it into the per-user `app_user.policy` columns. It must stay **strictly wire-invisible** — if it
+  ever reaches the API it becomes a redesign of Jellyfin's per-user policy model, which the
+  transliterate-don't-redesign rule (§0) forbids. Pure convenience for managing many users alike.
+
+### Considered and rejected
+
+The lens is disciplined, not maximal. Four plausible-looking candidates are *not* CRDs:
+
+- **Control plane as a CRD** — it has no domain shape beyond replica bounds. A stock `Deployment` +
+  KEDA scaler in the chart (or a field on `JellyfinServer`) covers it; a CRD would wrap nothing.
+- **A routing / `Ingress` CRD** — the plane-split rules (§2) are *derived from the fixed route
+  inventory*, not admin-tuned. Ship them as generated static `HTTPRoute`/Envoy config, regenerated
+  when the route inventory changes — an admin never edits them, so they are not desired-state.
+- **A backup CRD** — the store is Postgres; backup belongs to the Postgres operator's own
+  `Backup`/`ScheduledBackup` CRD (CloudNativePG et al.), not ours. Delegated, not rebuilt.
+- **Media-volume `PVC`s** — media is pre-provisioned infrastructure (NFS, existing PVs) that
+  `MediaLibrary.spec.paths` mount. Provisioning it is cluster-admin, not the Jellyfin reconciler.
+
+The reconciler (a controller in `deploy/`) watches all seven core CRDs across its two output modes.
+It is the **sole writer** of the spec-derived Postgres columns (library structure, server config,
+user identity/policy, API-key identity) and their `Secret`s, *and* the owner of the Kubernetes
+workloads the other CRDs materialize — `CronJob`/`Job` for `ScheduledTask`/`TaskRun`, and
+`Deployment`/HPA/PDB/`PVC` for `TranscodePool` — each held by `ownerReference` so it is
+garbage-collected with its CR. The server owns every `status` subresource and all runtime tables.
+That keeps one source of truth per field: the API serves spec-derived data read-only, the
+reconciler never touches runtime data, and no workload is hand-managed with `kubectl apply`.
 Building it is Phase 5 work (§7).
 
 ---
@@ -724,9 +798,10 @@ normalized diff.
 
 ### Phase 5 — Kubernetes operationalization
 
-The six CRDs and their reconciler (§6) — the four config/identity resources plus the
-`ScheduledTask` / `TaskRun` workload pair (`docs/analysis/05`) — scale-to-zero / hibernation of the
-control plane, transcode-pod disposal and reconciliation, and pod-local GC for transcode scratch.
+The seven CRDs and their reconciler (§6) — four config/identity resources plus the `ScheduledTask` /
+`TaskRun` / `TranscodePool` workload trio (`docs/analysis/05`) — scale-to-zero / hibernation of the
+control plane (and of `TranscodePool` at `minReplicas: 0`), transcode-pod disposal and
+reconciliation, and pod-local GC for transcode scratch.
 
 **Gate:** Control plane scales 0→N→0 with a captured session surviving a cold start; a transcode pod
 killed mid-session is either reconciled (session resumes) or fails cleanly to a client-visible
