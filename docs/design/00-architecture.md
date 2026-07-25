@@ -374,6 +374,49 @@ nothing per-segment or per-ping ever touches etcd.** This supersedes an earlier 
 identity and keepalive in a Postgres claim row (§2); because one pod serves one session, the pod is
 directly addressable and the inner state never needs to leave it.
 
+#### The resource
+
+`TranscodeSession` is minted by the control plane, not an admin — so it lives in the
+`runtime.jellyfin.io` API group, not `admin.jellyfin.io` (§6).
+
+```yaml
+apiVersion: runtime.jellyfin.io/v1alpha1   # control-plane-minted; humans never apply this
+kind: TranscodeSession
+metadata:
+  name: ps-a1b2c3                          # derived from playSessionId
+  ownerReferences: [{ kind: User, name: alice }]   # cascade-delete on logout
+spec:                                       # the immutable shape — written once, at playback start
+  playSessionId: a1b2c3                     # identity + ingress routing key (§2)
+  deviceId: 38f0...
+  userAgent: Swiftfin/1.2                   # part of the oracle's MD5 job identity; pod reconstructs it
+  poolRef: nvidia                           # which TranscodePool negotiation selected
+  source: { itemId: 7e9a..., mediaSourceId: 7e9a..., path: /media/movies/... }
+  output:                                   # StreamBuilder's negotiated target (the §2 plane boundary)
+    protocol: hls                           # hls | http
+    container: ts
+    videoCodec: h264
+    audioCodec: aac
+    maxBitrate: 8000000
+    subtitleMethod: encode
+    startTimeTicks: 0
+    segmentLengthSec: 6
+status:                                     # written by the operator/pod — coarse and low-write
+  phase: Running                            # Pending | Scheduled | Running | Terminating | Failed
+  podName: transcode-nvidia-ps-a1b2c3-7fx
+  endpoint: 10.1.4.7:8080                   # operator-maintained routing target (CNPG -rw analog, §2)
+  startedAt: 2026-07-25T18:00:03Z
+  # deliberately absent: producedSegment, lastPing, completionPercent, bytes —
+  # queried from the pod on demand (below), never mirrored into the CR
+```
+
+Two shape choices matter. **`spec.output` is StreamBuilder's decision, not the ffmpeg argv** — argv
+is computed *pod-side* by `EncodingHelper` from `output` plus the pod's local hardware/driver probe,
+because it is hardware-dependent (which GPU node it landed on, the ffmpeg version, the VAAPI driver;
+§4). Putting argv in spec would bake in a node's capabilities the session hasn't been scheduled onto
+yet. And **`status` carries only phase, pod, and endpoint** — the CNPG discipline: a `Cluster`'s
+status shows `currentPrimary` and health, not row counts, so a `TranscodeSession`'s status shows
+where it runs, not how many segments it has produced.
+
 #### How it works today (the monolith)
 
 `TranscodeManager` (`MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs`) holds
@@ -587,12 +630,45 @@ design lives in §5.
 | Devices + capabilities | none — self-register, client-posted | Postgres |
 | Playlists, collections | none — user-created content | Postgres |
 
+### Two API groups: `admin.jellyfin.io` and `runtime.jellyfin.io`
+
+The CRDs split across two API groups (working names) on one axis — **who creates the object** — and
+that axis is the RBAC boundary you actually want:
+
+- **`admin.jellyfin.io/v1alpha1`** — declared by a human or GitOps: `MediaLibrary`, `JellyfinServer`,
+  `User`, `ApiKey`, `ScheduledTask`, `TranscodePool` (and optional `MetadataProvider`, `Role`).
+  `TaskRun` lives here too — it is ephemeral, but a human mints it (`jellyfinctl task run`), so a
+  human needs create rights on it.
+- **`runtime.jellyfin.io/v1alpha1`** — minted by the control plane, never by a human:
+  `TranscodeSession` (§5). Today its only tenant; the group leaves room for future system-minted
+  objects.
+
+Four things fall out of the split that a single mixed group does not give you:
+
+1. **RBAC is one rule per group.** Grant humans/GitOps `create,update,delete` on
+   `admin.jellyfin.io` and *nothing* on `runtime.jellyfin.io`; grant the control-plane ServiceAccount
+   the reverse. A human then literally cannot `kubectl apply` a `TranscodeSession`, and the control
+   plane cannot rewrite library config — enforced by the API server, not by convention.
+2. **GitOps scope is the group, not a per-object ignore list.** Argo/Flux sync `admin.jellyfin.io`
+   from git and exclude `runtime.jellyfin.io` wholesale, so thousands of churning, machine-minted
+   `TranscodeSession`s never register as drift.
+3. **Reconciler ownership matches the split.** The config reconciler watches `admin.jellyfin.io`; the
+   `TranscodeSession` shape-operator (§5) watches `runtime.jellyfin.io`. Two groups, two controllers,
+   no overlap.
+4. **Lifecycle tuning differs by group.** `admin.*` is low-churn and long-lived; `runtime.*` is
+   high-churn and short-lived (session velocity), so informer resync and cache sizing are set per
+   group instead of compromised across a mixed one.
+
+`TaskRun` is the instructive near-edge: ephemeral like a runtime object, but human-created, so it
+sits in `admin.*` (with a GitOps-ignore label) rather than `runtime.*`. The axis is *who may create
+it*, which is exactly what RBAC keys on.
+
 **`MediaLibrary`** (namespaced). Replaces `LibraryStructureController` and the library-options half
 of `ConfigurationController`, both of which are out of scope as HTTP surfaces precisely because
 they become declarative. One CR per library. Spec shape:
 
 ```yaml
-apiVersion: jellyfin.io/v1alpha1
+apiVersion: admin.jellyfin.io/v1alpha1
 kind: MediaLibrary
 metadata: { name: movies }
 spec:
@@ -628,7 +704,7 @@ plane may use, throttling, segment TTL), network exposure, and the analytics/obs
 from §8. Its transcode block is the operator-facing knob that the transcode-plane pods read.
 
 ```yaml
-apiVersion: jellyfin.io/v1alpha1
+apiVersion: admin.jellyfin.io/v1alpha1
 kind: JellyfinServer
 metadata: { name: default }
 spec:
@@ -656,7 +732,7 @@ who the user is and what they may do — is admin desired-state; its runtime hal
 positions, live credential — is not. Split accordingly:
 
 ```yaml
-apiVersion: jellyfin.io/v1alpha1
+apiVersion: admin.jellyfin.io/v1alpha1
 kind: User
 metadata: { name: alice }
 spec:
@@ -689,7 +765,7 @@ integration; the reconciler generates the token and publishes it to a `Secret`, 
 never inlined in the CR or handled by the admin.
 
 ```yaml
-apiVersion: jellyfin.io/v1alpha1
+apiVersion: admin.jellyfin.io/v1alpha1
 kind: ApiKey
 metadata: { name: sonarr }
 spec:
@@ -744,7 +820,7 @@ A domain CRD adds four things a raw `CronJob` cannot express:
 `Job`s for interval-from-completion triggers.
 
 ```yaml
-apiVersion: jellyfin.io/v1alpha1
+apiVersion: admin.jellyfin.io/v1alpha1
 kind: ScheduledTask
 metadata: { name: nightly-movie-scan }
 spec:
@@ -765,7 +841,7 @@ status:
 or `jellyfinctl task run refresh-library --library movies`.
 
 ```yaml
-apiVersion: jellyfin.io/v1alpha1
+apiVersion: admin.jellyfin.io/v1alpha1
 kind: TaskRun
 metadata: { name: scan-movies-now }
 spec:
@@ -790,7 +866,7 @@ scratch template, and how much warm capacity to keep ready. `TranscodePool` is t
 per-session `TranscodeSession` pods (§5) are *scheduled onto* it.
 
 ```yaml
-apiVersion: jellyfin.io/v1alpha1
+apiVersion: admin.jellyfin.io/v1alpha1
 kind: TranscodePool
 metadata: { name: nvidia }
 spec:
