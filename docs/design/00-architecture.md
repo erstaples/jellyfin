@@ -311,6 +311,12 @@ The DTO is **assembled at the edge**, not stored. This mirrors the C# `DtoServic
 project on read. `docs/analysis/06-manager-coupling.md` confirms `UserManager` is already fully
 DB-backed (no in-process state), so the user/policy side ports cleanly.
 
+The `app_user` row has **two owners**, split along the same spec/status seam the CRDs use (§6). Its
+identity and policy columns (`username`, `enabled`, admin flag, `policy`) are **reconciler-owned**,
+projected from the `User` CR; the row's runtime companion `user_item_data` is **API-owned**, written
+by playstate calls at streaming frequency. The API serves the identity/policy columns read-only.
+This is why users are a CRD *and* Postgres rows at once, not one or the other — see §6.
+
 Core tables (illustrative, not exhaustive):
 
 ```
@@ -326,7 +332,7 @@ item_person(item_id uuid fk, person_id uuid fk, role text, type text, sort_order
 user_item_data(user_id uuid, item_id uuid, played bool, play_count int,
                playback_position_ticks bigint, is_favorite bool, rating double precision,
                last_played_date timestamptz, primary key (user_id, item_id))
-app_user(id uuid pk, username text unique, ... policy jsonb)
+app_user(id uuid pk, username text unique, enabled bool, ... policy jsonb)  -- identity/policy reconciled from User CR (§6)
 device(id text pk, user_id uuid, app_name text, app_version text, last_activity timestamptz)
 device_capabilities(device_id text pk, capabilities jsonb)   -- see below
 ```
@@ -418,14 +424,39 @@ There is no web UI. Native clients are the only consumers. Admin is CLI and CRDs
 
 ### Admin surface: CRDs and CLI
 
-The dividing principle: **a CRD represents desired-state, admin-owned configuration that an
-operator reconciles; runtime state does not.** Anything an administrator declares once and expects
-the cluster to converge to — libraries, server settings — is a custom resource. Anything that is
-produced by the system at runtime — users logging in, sessions, watch state, tokens, transcode
-claims — stays in Postgres and is managed through the API and a CLI, never through a CRD. Passwords
-and playback history are not desired-state and must not live in etcd.
+The dividing line is **spec versus status, not CRD versus not.** A thing belongs in a CRD when it
+has a non-trivial **admin-owned declarative half** — an identity and policy an administrator
+declares and expects the cluster to converge to — *even when it also carries runtime state*. Having
+runtime state is not disqualifying; you split it along the standard Kubernetes subresource seam:
 
-That yields exactly **two custom resources**, plus native Kubernetes objects for the rest.
+- **`spec`** — admin desired-state: identity, policy, enablement. The reconciler writes it; the
+  server reads it.
+- **`status`** — a bounded, regenerable summary the server observes and writes back. The server
+  writes it; the reconciler reads it. Two writers, two fields, no conflict — this is exactly how a
+  `Pod` works (user writes spec, kubelet writes status).
+- **Primary high-write runtime data** — playback positions, watch history, session rows, transcode
+  claims — stays in **Postgres, never etcd**. It is high-frequency, unbounded, must be
+  queried/joined/paginated, and is the system of record rather than observed state. `status`
+  summarizes it; it does not hold it.
+
+A thing is **Postgres-only** when it has *no* meaningful declarative half: it self-registers at
+runtime, is high-cardinality and churning, or is primary content discovered rather than declared.
+
+Applying that lens across the data model (§5) yields **four custom resources**. Two were already
+here; two more (`User`, `ApiKey`) fall out once the spec/status seam is applied to entities that
+carry both admin policy and runtime state.
+
+| Entity | Admin-owned declarative half | Home |
+|:--|:--|:--|
+| Library structure + options | paths, providers, scan policy | **`MediaLibrary`** CRD |
+| Server + transcode policy | allowed hwaccel, defaults, sinks | **`JellyfinServer`** CRD |
+| User identity + policy | username, roles, enablement, parental/access policy | **`User`** CRD (spec) + Postgres (runtime) |
+| API integration key | named integration, enablement | **`ApiKey`** CRD (spec) + `Secret` (token) |
+| Items / media sources / streams | none — scanner-discovered | Postgres |
+| Playback & user data (`user_item_data`) | none — primary high-write | Postgres |
+| Sessions, live-stream handles, transcode claims | none — runtime | Postgres |
+| Devices + capabilities | none — self-register, client-posted | Postgres |
+| Playlists, collections | none — user-created content | Postgres |
 
 **`MediaLibrary`** (namespaced). Replaces `LibraryStructureController` and the library-options half
 of `ConfigurationController`, both of which are out of scope as HTTP surfaces precisely because
@@ -481,22 +512,87 @@ spec:
     defaultMaxStreamingBitrate: 120000000
   observability:
     decisionEventSink: otlp://...          # the playback-decision stream from §8
+status:
+  observedHardwareAcceleration: [nvenc]    # what the transcode nodes actually detected
+  conditions: [...]                         # diverges from spec if allowed != available
 ```
 
-**Not CRDs, by the principle above:**
+Its `status` is the spec/status seam applied to the server: `spec.transcoding.hardwareAccelerationType`
+is what the admin *allows*, `status.observedHardwareAcceleration` is what the transcode nodes report
+*available*. When they diverge (admin asked `nvenc`, nodes probed none) that surfaces in
+`status`/`conditions` instead of failing silently — the §8 correctness ethos applied to config.
 
-- **Users** — runtime state (credentials, watch history, per-user policy). Managed by a
-  `jellyfinctl user` CLI against the control-plane API, backed by the `app_user` table (§5). The
-  first admin is bootstrapped from a `Secret` at install, not a CR.
-- **Scheduled tasks** — native `CronJob` objects (`docs/analysis/05`), managed with `kubectl`. A
-  custom resource would add nothing over the built-in.
-- **Server config that is pure key/value** with no reconciliation logic — could ride in a
-  `ConfigMap` the pods mount, but is folded into `JellyfinServer` above so there is a single
-  admin-facing object with a `status` and validation, rather than an unvalidated blob.
+**`User`** (namespaced). This is the resource the spec/status seam rescues. Its declarative half —
+who the user is and what they may do — is admin desired-state; its runtime half — watch history,
+positions, live credential — is not. Split accordingly:
 
-The reconciler (a controller in `deploy/`) watches both CRDs and owns the write path into Postgres
-and the CronJob set. It is the *only* writer for library structure and server config; the API
-serves those as read-only, so there is one source of truth. Building it is Phase 5 work (§7).
+```yaml
+apiVersion: jellyfin.io/v1alpha1
+kind: User
+metadata: { name: alice }
+spec:
+  username: alice
+  enabled: true
+  policy:
+    isAdministrator: false
+    enabledLibraries: [movies, tvshows]    # references MediaLibrary names
+    maxParentalRating: 13
+    accessSchedules: [...]
+    sessionLimit: 3
+  initialCredentialSecretRef:              # optional; read once at creation, never rewritten
+    name: alice-initial-password
+status:
+  lastLogin: <timestamp>
+  activeSessions: <int>                     # bounded observed summary, not the session rows
+  conditions: [...]
+```
+
+The reconciler projects `spec` into the identity/policy columns of `app_user` (§5). Everything the
+user *does* — `user_item_data` (positions, favorites, watch history), self-service password changes
+— goes through the API into Postgres and **never touches the CR**: `initialCredentialSecretRef` is
+consumed once to seed the first password, after which the live credential is Postgres-owned. The
+first admin is now simply a `User` CR with `isAdministrator: true` — cleaner than the earlier
+Secret-only bootstrap.
+
+**`ApiKey`** (namespaced). A named integration credential (an *arr app, a script) is textbook
+declarative admin config: low-cardinality, long-lived, GitOps-friendly. The admin declares the
+integration; the reconciler generates the token and publishes it to a `Secret`, so key material is
+never inlined in the CR or handled by the admin.
+
+```yaml
+apiVersion: jellyfin.io/v1alpha1
+kind: ApiKey
+metadata: { name: sonarr }
+spec:
+  appName: Sonarr
+  enabled: true
+status:
+  secretRef: { name: jellyfin-apikey-sonarr }   # reconciler-generated token lands here
+  lastUsed: <timestamp>
+  conditions: [...]
+```
+
+**Still Postgres-only, and why (the lens rejecting the rest):**
+
+- **Playback & user data** (`user_item_data`) — primary, high-write (a progress ping every few
+  seconds per stream), must be queried for resume/next-up. The `User` CR's `status` summarizes it;
+  it cannot live in etcd.
+- **Sessions, live-stream handles, transcode claims** — ephemeral, per-connection runtime with no
+  declarative half.
+- **Devices & capabilities** — self-register at runtime, high-cardinality, client-posted. (Admin
+  policy over a device — enable/block — is thin; if it grows it attaches to the owning `User`, not
+  a `Device` CR of its own.)
+- **Items, media sources, streams** — discovered by the scanner from disk, not declared. The
+  *library* is declared (`MediaLibrary`); its contents are found.
+- **Playlists & collections** — user-created content, mutated constantly, queried and joined.
+  Content, not config.
+- **Scheduled tasks** — native `CronJob`s (`docs/analysis/05`); a CRD would add nothing.
+
+The reconciler (a controller in `deploy/`) watches all four CRDs and is the **sole writer** of the
+spec-derived columns (library structure, server config, user identity/policy, API-key identity) and
+the CronJob set. The server owns every `status` subresource and all runtime tables. That keeps one
+source of truth per field: the API serves spec-derived data read-only, and the reconciler never
+touches runtime data. Building it is Phase 5 work (§7).
 
 ---
 
