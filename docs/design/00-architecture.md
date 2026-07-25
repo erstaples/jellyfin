@@ -418,7 +418,8 @@ Not built, deliberately. Roughly a third of the API surface, 140 operations (the
   `StartupController` (first-run wizard), `BrandingController` CSS/splashscreen,
   `ConfigurationController` web config surface, `ActivityLogController`, `EnvironmentController`
   (filesystem browser), `BackupController`, `LibraryStructureController`,
-  `ScheduledTasksController` (tasks are CronJobs managed by `kubectl`).
+  `ScheduledTasksController` (its recurring/ad-hoc task surface becomes the `ScheduledTask` /
+  `TaskRun` CRDs in §6, not this HTTP controller).
 
 There is no web UI. Native clients are the only consumers. Admin is CLI and CRDs, specified next.
 
@@ -442,16 +443,20 @@ runtime state is not disqualifying; you split it along the standard Kubernetes s
 A thing is **Postgres-only** when it has *no* meaningful declarative half: it self-registers at
 runtime, is high-cardinality and churning, or is primary content discovered rather than declared.
 
-Applying that lens across the data model (§5) yields **four custom resources**. Two were already
-here; two more (`User`, `ApiKey`) fall out once the spec/status seam is applied to entities that
-carry both admin policy and runtime state.
+Applying that lens yields **six custom resources across the reconciler's two output modes.** Four
+are *config/identity* CRDs the reconciler projects into Postgres rows and `Secret`s; two are *task*
+CRDs it materializes into Kubernetes `CronJob`/`Job` workloads (covered after the config four). Of
+the config four, two were already here; `User` and `ApiKey` fall out once the spec/status seam is
+applied to entities that carry both admin policy and runtime state.
 
 | Entity | Admin-owned declarative half | Home |
 |:--|:--|:--|
-| Library structure + options | paths, providers, scan policy | **`MediaLibrary`** CRD |
-| Server + transcode policy | allowed hwaccel, defaults, sinks | **`JellyfinServer`** CRD |
+| Library structure + options | paths, providers, scan policy | **`MediaLibrary`** CRD → Postgres |
+| Server + transcode policy | allowed hwaccel, defaults, sinks | **`JellyfinServer`** CRD → Postgres |
 | User identity + policy | username, roles, enablement, parental/access policy | **`User`** CRD (spec) + Postgres (runtime) |
 | API integration key | named integration, enablement | **`ApiKey`** CRD (spec) + `Secret` (token) |
+| Recurring task | task type, target, trigger, concurrency | **`ScheduledTask`** CRD → `CronJob`/`Job` |
+| Ad-hoc task run | task type, target | **`TaskRun`** CRD → `Job` |
 | Items / media sources / streams | none — scanner-discovered | Postgres |
 | Playback & user data (`user_item_data`) | none — primary high-write | Postgres |
 | Sessions, live-stream handles, transcode claims | none — runtime | Postgres |
@@ -586,13 +591,78 @@ status:
   *library* is declared (`MediaLibrary`); its contents are found.
 - **Playlists & collections** — user-created content, mutated constantly, queried and joined.
   Content, not config.
-- **Scheduled tasks** — native `CronJob`s (`docs/analysis/05`); a CRD would add nothing.
 
-The reconciler (a controller in `deploy/`) watches all four CRDs and is the **sole writer** of the
-spec-derived columns (library structure, server config, user identity/policy, API-key identity) and
-the CronJob set. The server owns every `status` subresource and all runtime tables. That keeps one
-source of truth per field: the API serves spec-derived data read-only, and the reconciler never
-touches runtime data. Building it is Phase 5 work (§7).
+### Tasks: domain CRDs the reconciler materializes into Jobs
+
+The four resources above are the reconciler's *first* output mode — it writes Postgres rows and
+`Secret`s. Scheduled and ad-hoc tasks are its *second* mode: the CR is an app-domain task
+definition, and the reconciler **spawns a Kubernetes `CronJob` or `Job` from it**, owning that
+workload object by `ownerReference` so it is garbage-collected with the CR.
+
+An earlier draft said tasks should be bare `CronJob`s and a CRD "would add nothing." That was wrong.
+A domain CRD adds four things a raw `CronJob` cannot express:
+
+1. **Interval-from-completion semantics.** `docs/analysis/05` flags that Jellyfin's `IntervalTrigger`
+   measures from last *completion* while a `CronJob` is wall-clock. A `ScheduledTask` reconciler
+   watches the prior `Job` finish and schedules the next itself — implementing the semantics rather
+   than approximating them with `concurrencyPolicy: Forbid`.
+2. **Typed domain targets.** `taskType` is an enum over the ported `IScheduledTask` set
+   (`docs/analysis/05`), and targets are CR references (`libraryRef`) validated against
+   `MediaLibrary` — not an opaque container command.
+3. **A kubectl-native ad-hoc path.** A `TaskRun` CR replaces the out-of-scope
+   `POST /ScheduledTasks/Running/{taskId}` we dropped with `ScheduledTasksController` — "scan this
+   library now" without reviving a web-oriented HTTP surface.
+4. **Cross-run `status`.** Last result, next run, active count — the spec/status seam again.
+
+**`ScheduledTask`** (recurring). Reconciler → `CronJob` for wall-clock triggers, or self-scheduled
+`Job`s for interval-from-completion triggers.
+
+```yaml
+apiVersion: jellyfin.io/v1alpha1
+kind: ScheduledTask
+metadata: { name: nightly-movie-scan }
+spec:
+  taskType: RefreshLibrary          # enum over the ported IScheduledTask set (docs/analysis/05)
+  target: { libraryRef: movies }    # validated against a MediaLibrary CR
+  trigger:
+    interval: 24h                   # from last completion; reconciler self-schedules
+    # or: schedule: "0 3 * * *"     # wall-clock; reconciler emits a CronJob
+  concurrencyPolicy: Forbid         # never overlap a long scan
+status:
+  lastRun: <timestamp>
+  lastResult: Succeeded
+  nextRun: <timestamp>
+  active: 0
+```
+
+**`TaskRun`** (one-shot, ad-hoc/manual). Reconciler → a single `Job`; `kubectl create -f run.yaml`
+or `jellyfinctl task run refresh-library --library movies`.
+
+```yaml
+apiVersion: jellyfin.io/v1alpha1
+kind: TaskRun
+metadata: { name: scan-movies-now }
+spec:
+  taskType: RefreshLibrary
+  target: { libraryRef: movies }
+status:
+  jobRef: { name: jellyfin-taskrun-scan-movies-now }
+  phase: Running                    # Pending | Running | Succeeded | Failed
+```
+
+Not every task becomes a `ScheduledTask`. The three **pod-local GC** tasks from `docs/analysis/05`
+(transcode/cache cleanup) stay pod-local goroutines scoped to a pod's own scratch volume — a
+cluster-level `Job` deleting another live pod's scratch dir is exactly the failure that analysis
+warns against. `ScheduledTask` is for cluster-level work (library scan, people validation, chapter
+and trickplay images, subtitle/segment extraction); pod-local GC is not a CRD.
+
+The reconciler (a controller in `deploy/`) watches all six CRDs across its two output modes: it is
+the **sole writer** of the spec-derived Postgres columns (library structure, server config, user
+identity/policy, API-key identity) and their `Secret`s, *and* the owner of the `CronJob`/`Job`
+objects the task CRDs materialize. The server owns every `status` subresource and all runtime
+tables. That keeps one source of truth per field: the API serves spec-derived data read-only, the
+reconciler never touches runtime data, and no task workload is hand-managed with `kubectl apply`.
+Building it is Phase 5 work (§7).
 
 ---
 
@@ -654,8 +724,9 @@ normalized diff.
 
 ### Phase 5 — Kubernetes operationalization
 
-CronJobs (`docs/analysis/05`), scale-to-zero / hibernation of the control plane, transcode-pod
-disposal and reconciliation, the `MediaLibrary` / `JellyfinServer` CRDs and their reconciler (§6).
+The six CRDs and their reconciler (§6) — the four config/identity resources plus the
+`ScheduledTask` / `TaskRun` workload pair (`docs/analysis/05`) — scale-to-zero / hibernation of the
+control plane, transcode-pod disposal and reconciliation, and pod-local GC for transcode scratch.
 
 **Gate:** Control plane scales 0→N→0 with a captured session surviving a cold start; a transcode pod
 killed mid-session is either reconciled (session resumes) or fails cleanly to a client-visible
