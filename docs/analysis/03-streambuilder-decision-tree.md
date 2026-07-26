@@ -101,15 +101,20 @@ profile with zero failures wins).
 
 Four entry points, each handling a disjoint subset:
 
-| Entry point | Line | Values handled |
-|:--|--:|--:|
-| `IsVideoConditionSatisfied` | `:38` | 18 |
-| `IsImageConditionSatisfied` | `:112` | 2 |
-| `IsAudioConditionSatisfied` | `:134` | 4 |
-| `IsVideoAudioConditionSatisfied` | `:162` | 6 |
+| Entry point | Line | Values handled | Unhandled property |
+|:--|--:|--:|:--|
+| `IsVideoConditionSatisfied` | `:38` | 19 | returns `true` (`:100-101`) |
+| `IsImageConditionSatisfied` | `:112` | 2 | **throws** `ArgumentException` (`:120-122`) |
+| `IsAudioConditionSatisfied` | `:134` | 4 | **throws** `ArgumentException` (`:146-148`) |
+| `IsVideoAudioConditionSatisfied` | `:162` | 6 | **throws** `ArgumentException` (`:185-187`) |
 
-A condition whose property is not handled by the entry point it reaches returns **true**
-(satisfied) rather than failing. Unknown conditions are permissive.
+**Unhandled-property behaviour is not uniform.** Only the video entry point is permissive. The
+other three throw, which surfaces as a 500 from `PlaybackInfo` — so a client `CodecProfile` of
+`Type = Audio` or `VideoAudio` carrying, say, a `Width` condition crashes the audio compatibility
+check. The port must reproduce the throw, not silently return `true`. See
+`08-streambuilder-port.md` §5.1 and hazard H13.
+
+`Has64BitOffsets` is handled by no entry point at all.
 
 ### Application — `ApplyTranscodingConditions` (`:1741`)
 
