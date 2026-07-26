@@ -1,0 +1,295 @@
+# Differential harness CI — StreamBuilder + EncodingHelper.
+#
+# THIS FILE DOES NOT BELONG IN THE ORACLE REPO. It is staged here for review only.
+# Destination: jellyfin-go/.github/workflows/differential.yml   (see README.md)
+#
+# Contract: docs/analysis/07-harness-contract.md (in the oracle repo, under oracle/).
+# Gates implemented here: 0, 1, 2, 3, 4, 5, 6, 7.
+
+name: differential
+
+# NOTE ON PATH FILTERING: this uses paths-ignore (a denylist), deliberately, not
+# paths (an allowlist). With an allowlist it is easy to forget an entry and
+# silently skip the harness on a change that needed it — and if this workflow is
+# ever a required status check, a skipped run never reports and blocks the PR
+# forever. A denylist fails safe: it only skips when EVERY changed file is docs.
+#
+# The oracle submodule appears to git as a single gitlink path, `oracle`, so a
+# pin bump is an ordinary file change and is NOT ignored here — which is what we
+# want, because Gate 0 and the golden-drift gate exist precisely to catch it.
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
+  pull_request:
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: differential-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The analyzer at Directory.Build.props:23-24 is attached in Debug only, and the
+  # prebuilt Jellyfin.CodeAnalysis.dll can reference a newer Roslyn than the pinned
+  # SDK ships (CS9057). Release sidesteps it without touching oracle source.
+  DOTNET_CONFIGURATION: Release
+  DOTNET_NOLOGO: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate 2 — host assertion.
+  #
+  # The oracle reads ambient host facts that are NOT injectable through
+  # IMediaEncoder (contract §3.3): OperatingSystem.Is*, OSArchitecture,
+  # ProcessorCount, and Environment.OSVersion.Version.
+  #
+  # NOTE ON CONTAINERS: running the job in a container pins the *userland*, not
+  # the kernel — containers share the host kernel, so OSVersion.Version still
+  # reports whatever the GitHub runner image happens to boot. So this asserts
+  # which SIDE of each branching gate the runner sits on, transliterated from
+  # the oracle's own predicates, never an exact version string. Pinning an exact
+  # kernel would break on every runner image bump for no correctness gain.
+  # ---------------------------------------------------------------------------
+  host-assert:
+    # Guard so a fork of the Go repo does not burn minutes on a harness whose
+    # goldens it has no way to regenerate. Change the value when the repo moves.
+    if: github.repository == 'erstaples/jellyfin-go'
+    runs-on: ubuntu-24.04
+    outputs:
+      kernel: ${{ steps.facts.outputs.kernel }}
+      arch: ${{ steps.facts.outputs.arch }}
+      nproc: ${{ steps.facts.outputs.nproc }}
+    steps:
+      - id: facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          KERNEL="$(uname -r)"
+          ARCH="$(uname -m)"
+          NPROC="$(nproc)"
+          echo "kernel=$KERNEL" >> "$GITHUB_OUTPUT"
+          echo "arch=$ARCH"     >> "$GITHUB_OUTPUT"
+          echo "nproc=$NPROC"   >> "$GITHUB_OUTPUT"
+          echo "kernel=$KERNEL arch=$ARCH nproc=$NPROC"
+
+          if [ "$ARCH" != "x86_64" ]; then
+            echo "::error::Contract §3.3 pins host_arch=x86_64; runner reports $ARCH." \
+                 "RuntimeInformation.OSArchitecture gates decoder selection at" \
+                 "EncodingHelper.cs:6472,6493. Update known-uncovered.md before changing this."
+            exit 1
+          fi
+
+          # Kernel gates that actually branch in EncodingHelper:
+          #   :72   _minKernelVersionAmdVkFmtModifier   v >= 5.15
+          #   :2124-2126  i915 hang (qsv path, Linux only) — transliterated below
+          # We assert which SIDE of each gate we are on. If a runner bump moves
+          # us across one, this fails loudly rather than silently changing which
+          # branches the corpus covers.
+          ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+          KV="$(echo "$KERNEL" | grep -oE '^[0-9]+\.[0-9]+(\.[0-9]+)?')"
+          KMAJ="${KV%%.*}"; KREST="${KV#*.}"; KMIN="${KREST%%.*}"
+
+          if ! ver_ge "$KV" "5.15"; then
+            echo "::error::kernel $KV is below _minKernelVersionAmdVkFmtModifier (5.15," \
+                 "EncodingHelper.cs:72). Corpus coverage assumptions in known-uncovered.md" \
+                 "no longer hold."
+            exit 1
+          fi
+
+          # Transliterated from EncodingHelper.cs:2124-2126. Note the 6.0.x carve-out:
+          #   isFixedKernel60   = major==6 && minor==0 && v >= 6.0.18
+          #   isUnaffected      = v < 5.18 || v > 6.1.3
+          #   affected          = !(isUnaffected || isFixedKernel60)
+          # Do NOT simplify this to a plain range — 6.0.18..6.0.x is unaffected and
+          # a range check would fail a perfectly good runner.
+          isFixedKernel60=false
+          if [ "$KMAJ" = "6" ] && [ "$KMIN" = "0" ] && ver_ge "$KV" "6.0.18"; then
+            isFixedKernel60=true
+          fi
+          isUnaffected=false
+          if ! ver_ge "$KV" "5.18" || ver_ge "$KV" "6.1.4"; then
+            isUnaffected=true
+          fi
+
+          if [ "$isUnaffected" = false ] && [ "$isFixedKernel60" = false ]; then
+            echo "::error::kernel $KV is AFFECTED by the i915 hang workaround" \
+                 "(EncodingHelper.cs:2124-2126). known-uncovered.md declares those branches" \
+                 "uncovered; they are now reachable and the corpus must be extended first."
+            exit 1
+          fi
+
+          echo "host assertion OK: x86_64, >= 5.15, unaffected by i915 hang workaround"
+
+  # ---------------------------------------------------------------------------
+  # Gates 0, 1, 4 — build the oracle, prove it behaves, emit oracle-side output.
+  # ---------------------------------------------------------------------------
+  oracle:
+    needs: host-assert
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive # oracle/ is a pinned submodule (design §1)
+          fetch-depth: 0
+
+      # Use setup-dotnet, NOT the packages.microsoft.com apt route. That
+      # workaround exists only for sandboxes whose egress proxy blocks
+      # builds.dotnet.microsoft.com; GitHub-hosted runners have no such block.
+      # global.json pins 10.0.0 / rollForward latestMinor.
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: oracle/global.json
+
+      # corpusgen and coverage are Go programs; pin from go.mod rather than
+      # inheriting whatever the runner image happens to ship.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('oracle/**/*.csproj', 'oracle/Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # --- Gate 0: the oracle behaves as its own checked-in expectations claim.
+      # If this fails, the oracle pin moved under us and every golden is suspect.
+      # Runs before anything else touches the oracle.
+      - name: 'Gate 0 — oracle baseline'
+        working-directory: oracle
+        run: |
+          dotnet test tests/Jellyfin.Model.Tests/Jellyfin.Model.Tests.csproj \
+            -c "$DOTNET_CONFIGURATION" --nologo
+
+      - name: Build harness
+        run: dotnet build differential/oracle-harness/JellyfinOracle.Harness.csproj -c "$DOTNET_CONFIGURATION"
+
+      # --- Corpus is generated deterministically from fixtures, never hand-edited.
+      - name: Generate corpus
+        run: |
+          go run ./differential/cmd/corpusgen \
+            --fixtures fixtures/ \
+            --out "$RUNNER_TEMP/corpus.ndjson"
+          wc -l "$RUNNER_TEMP/corpus.ndjson"
+
+      # --- Gate 1: every corpus input round-trips on the C# side.
+      # Catches both §2.2 defects: the [JsonIgnore] silent drop (which fails
+      # GREEN if unguarded) and the JsonFlagEnumConverter.Read throw.
+      - name: 'Gate 1 — protocol round-trip'
+        run: |
+          dotnet run --no-build -c "$DOTNET_CONFIGURATION" \
+            --project differential/oracle-harness/JellyfinOracle.Harness.csproj \
+            -- --self-check-roundtrip < "$RUNNER_TEMP/corpus.ndjson"
+
+      - name: Run oracle
+        run: |
+          dotnet run --no-build -c "$DOTNET_CONFIGURATION" \
+            --project differential/oracle-harness/JellyfinOracle.Harness.csproj \
+            -- --coverage-out "$RUNNER_TEMP/coverage.json" \
+            < "$RUNNER_TEMP/corpus.ndjson" > "$RUNNER_TEMP/oracle.ndjson"
+
+      # --- Oracle drift gate. The committed goldens are the oracle's output at
+      # the pinned commit. If these differ, either the pin moved or the harness
+      # changed meaning — both require human review, neither is a Go-side bug.
+      - name: 'Gate 0b — golden drift'
+        run: |
+          if ! diff -u fixtures/golden/oracle.ndjson "$RUNNER_TEMP/oracle.ndjson" > "$RUNNER_TEMP/drift.diff"; then
+            echo "::error::Oracle output changed against committed goldens."
+            echo "The oracle submodule pin or the harness changed. Review, then regenerate:"
+            echo "  make regenerate-goldens"
+            head -c 20000 "$RUNNER_TEMP/drift.diff"
+            exit 1
+          fi
+
+      # --- Gate 4: no silent coverage loss. known-uncovered.md is asserted to
+      # MATCH, not merely to contain — a branch quietly leaving coverage fails too.
+      - name: 'Gate 4 — corpus coverage'
+        run: |
+          go run ./differential/cmd/coverage \
+            --report "$RUNNER_TEMP/coverage.json" \
+            --known-uncovered differential/known-uncovered.md \
+            --require-pipelines 7 \
+            --require-version-gates 20
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oracle-output
+          path: |
+            ${{ runner.temp }}/oracle.ndjson
+            ${{ runner.temp }}/corpus.ndjson
+            ${{ runner.temp }}/coverage.json
+            ${{ runner.temp }}/drift.diff
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Gates 3, 5, 6 — the actual differential. Go side vs the oracle goldens.
+  #
+  # Deliberately depends on `oracle` only for ordering of the drift gate: the Go
+  # side diffs against the COMMITTED goldens, so a Go developer gets the same
+  # result locally without a .NET toolchain. That is the point of committing them.
+  # ---------------------------------------------------------------------------
+  differential:
+    needs: [host-assert, oracle]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate corpus
+        run: |
+          go run ./differential/cmd/corpusgen \
+            --fixtures fixtures/ \
+            --out "$RUNNER_TEMP/corpus.ndjson"
+
+      - name: Run Go implementation
+        run: |
+          go run ./differential/cmd/goside \
+            < "$RUNNER_TEMP/corpus.ndjson" > "$RUNNER_TEMP/go.ndjson"
+
+      # Gate 3 (StreamInfo) and Gate 5 (argv) are reported per client family so
+      # partial progress is visible — Chrome green while WebOS is still red.
+      - name: 'Gates 3 + 5 — zero-diff vs oracle'
+        run: |
+          go run ./differential/cmd/diff \
+            --oracle fixtures/golden/oracle.ndjson \
+            --go "$RUNNER_TEMP/go.ndjson" \
+            --normalization differential/normalization.json \
+            --report-by-family \
+            --junit "$RUNNER_TEMP/differential.xml"
+
+      # Gate 6 — the escaping tier. Paths containing : ' " and spaces are
+      # compared literally, with no placeholder substitution, so that
+      # EscapeSubtitleFilterPath and EncodingUtils.NormalizePath stay under test.
+      - name: 'Gate 6 — adversarial paths'
+        run: |
+          go run ./differential/cmd/diff \
+            --oracle fixtures/golden/oracle-adversarial.ndjson \
+            --go "$RUNNER_TEMP/go.ndjson" \
+            --tier adversarial \
+            --no-placeholder-substitution
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: differential-report
+          path: |
+            ${{ runner.temp }}/go.ndjson
+            ${{ runner.temp }}/differential.xml
+          if-no-files-found: ignore
+          retention-days: 14
