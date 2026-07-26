@@ -12,9 +12,14 @@ the C# source in this repo, pinned as a read-only submodule (§1 of the design d
 harness is a thin C# console app linked against it, speaking JSON over stdin/stdout, plus a
 Go-side driver that feeds it the same corpus it feeds the port.
 
-**Environment note.** The .NET SDK is not installed in the session that produced this
-document (`which dotnet` fails). Nothing here has been compiled or executed. Every step that
-requires the SDK is marked **[SDK]**. Those steps run in the Go repo's CI, not here.
+**Verification status.** The document was first drafted from source alone, with no SDK
+available. The SDK has since been installed (`dotnet` 10.0.110 — see §7 for how) and the
+claims that could be checked locally **have been executed**: the oracle test suite, the
+serializer behaviour, the `DynamicHlsController` reflection route, the ambient host facts, the
+`containerSupported` question, and an end-to-end argv build with a synthetic capability
+profile and no ffmpeg, media, or GPU. Two source-only inferences turned out to be wrong and
+are corrected in place (§2.2, and the `defaultPreset` note under Gate 5a). Steps still
+requiring work in the Go repo's CI remain marked **[SDK]**.
 
 ---
 
@@ -151,9 +156,28 @@ Consequences the harness must absorb:
      `DynamicHlsController` instance constructed with mocked services. Fragile but requires
      zero oracle edits. **Recommended.**
    - **(c)** Copy the method body into the harness. Rejected — a copy is not an oracle.
-   Choosing (b) means the harness must construct `DynamicHlsController`; its ctor
-   dependencies must be enumerated and mocked. **[SDK] — the ctor arg list needs to be read
-   off a compiled signature and the reflection call verified to run.**
+   Choosing (b) means the harness must construct `DynamicHlsController` and mock its ctor
+   dependencies. **Both halves verified against the compiled assembly.** There is exactly
+   one constructor, taking 11 parameters:
+
+   ```
+   ILibraryManager libraryManager            IServerConfigurationManager serverConfigurationManager
+   IUserManager userManager                  IMediaEncoder mediaEncoder
+   IMediaSourceManager mediaSourceManager    IFileSystem fileSystem
+   ITranscodeManager transcodeManager        ILogger<DynamicHlsController> logger
+   DynamicHlsHelper dynamicHlsHelper         EncodingHelper encodingHelper
+   IDynamicHlsPlaylistGenerator dynamicHlsPlaylistGenerator
+   ```
+
+   Nine are interfaces (mockable outright). Two are concrete classes — `DynamicHlsHelper`
+   and `EncodingHelper` — and must be constructed for real; `EncodingHelper` is the one
+   already built with the synthetic capability profile (§3.1), which is what makes the whole
+   arrangement deterministic.
+
+   `GetCommandLineArguments` resolves under
+   `BindingFlags.NonPublic | BindingFlags.Instance` with signature
+   `(String outputPath, StreamState state, Boolean isEventPlaylist, Int32 startNumber)` —
+   matching `:1574`. Option (b) is confirmed viable.
 3. **Go-side placement.** The design doc puts `DynamicHlsController` in the transcode plane
    and `PlaybackInfo` in the control plane. `GetCommandLineArguments` is transcode-plane code
    that lives in an API controller in C#; the Go port should relocate it into the
@@ -253,30 +277,54 @@ settings: `DefaultIgnoreCondition = WhenWritingNull`,
 This is the same loader the existing upstream corpus uses
 (`tests/Jellyfin.Model.Tests/Dlna/StreamBuilderTests.cs:730`).
 
-**Blocking defect in the default options — flag enums cannot be read back.**
-`JsonFlagEnumConverter<T>.Read` throws `NotImplementedException`
-(`src/Jellyfin.Extensions/Json/Converters/JsonFlagEnumConverter.cs:18-20`); only `Write` is
-implemented, emitting an array of member-name strings (`:23-35`). The factory claims every
-`[Flags]` enum (`JsonFlagEnumConverterFactory.cs:16-18`). Two `[Flags]` enums appear on
-harness *inputs*:
+**Two distinct defects around `[Flags]` enums. Both verified by execution
+(`dotnet` 10.0.110); the first is not what it looks like from source.**
 
-- `MediaSourceInfo.TranscodeReasons` (`MediaSourceInfo.cs:120`) — `TranscodeReason` is
-  `[Flags]` (`MediaBrowser.Model/Session/TranscodeReason.cs:7`).
-- `MediaSourceInfo.DefaultAudioIndexSource` (`MediaSourceInfo.cs:123`) — `AudioIndexSource`
-  is `[Flags]` (`MediaBrowser.Model/Dto/AudioIndexSource.cs:8`).
+**(a) `[JsonIgnore]` silently drops two load-bearing input fields.** The properties that
+matter on the *input* side are annotated `[JsonIgnore]`:
+
+- `MediaSourceInfo.TranscodeReasons` — `MediaSourceInfo.cs:118-119`
+- `MediaSourceInfo.DefaultAudioIndexSource` — `MediaSourceInfo.cs:121-122`
+
+so they are never written **and never read**. Confirmed empirically: serializing a
+`MediaSourceInfo` with `DefaultAudioIndexSource = User | Language` through
+`JsonDefaults.Options` emits no such key, and feeding
+`{"DefaultAudioIndexSource":["User"]}` back deserializes to `None` **without raising
+anything**.
 
 `DefaultAudioIndexSource` is **load-bearing**: it narrows the candidate audio-stream set in
 `BuildVideoItem` (`StreamBuilder.cs:670-707`, per `03-streambuilder-decision-tree.md` step 2).
-A corpus that cannot express it cannot cover the audio-reselection branches. The existing
-upstream fixtures dodge this only because none of them sets the field — verified: no
-`Test Data/*.json` mentions `DefaultAudioIndexSource` or `TranscodeReasons`.
+So a corpus fixture cannot express it, and — worse than an exception — a fixture that tries
+is **silently ignored**. Both implementations would then run with `None` and agree, producing
+a false green over the entire audio-reselection branch set. The existing upstream fixtures
+never set the field, so nothing upstream catches this.
 
-**Resolution:** the harness constructs its own `JsonSerializerOptions` — a copy-constructor
-clone of `JsonDefaults.Options` with a read-capable flag-enum converter substituted, accepting
-both the array-of-names write form and a plain integer. The write side stays byte-identical to
-`JsonDefaults`, so responses still match the wire. This converter lives in the harness, not the
-oracle. **[SDK] — the copy-constructor override needs to be compiled and confirmed to
-actually displace the factory-produced converter.**
+A read-capable converter does **not** fix this; `[JsonIgnore]` is checked before converters
+run. The harness must instead either (i) supply a custom `IJsonTypeInfoResolver` that clears
+`ShouldSerialize`/re-enables `Set` for these two properties, or (ii) carry them as explicit
+side-channel fields in the request envelope and assign them after deserialization. **(ii) is
+recommended** — it needs no reflection into serializer internals and makes the override
+visible in the corpus schema. §4.1's `mediaSourceOverlay` block exists for this.
+
+**(b) `JsonFlagEnumConverter<T>.Read` genuinely throws — on the output type.**
+`src/Jellyfin.Extensions/Json/Converters/JsonFlagEnumConverter.cs:18-20` throws
+`NotImplementedException`; only `Write` is implemented, emitting an array of member-name
+strings (`:23-35`), and the factory claims every `[Flags]` enum
+(`JsonFlagEnumConverterFactory.cs:16-18`). Verified: deserializing `["ContainerNotSupported"]`
+as a `TranscodeReason` through `JsonDefaults.Options` throws `NotImplementedException`.
+
+A reflection sweep over the twelve input/output types finds exactly one `[Flags]`-typed
+property that is *not* `[JsonIgnore]`d and therefore would hit `Read`:
+**`StreamInfo.TranscodeReasons`** (`StreamInfo.cs:255`). That is the harness's **output**
+type — so this bites the moment the driver deserializes a C# response into a `StreamInfo`,
+or reloads a stored golden `StreamInfo` fixture.
+
+**Resolution for (b):** the harness clones `JsonDefaults.Options` via the copy constructor,
+removes the `JsonFlagEnumConverterFactory` instance, and inserts a read-capable replacement
+whose `Write` is byte-identical to the original. **Verified working**: the clone accepts the
+array-of-names form and a plain integer, and re-serializing the result reproduces the
+original JSON exactly. Note the factory must be *removed*, not merely preceded — inserting
+ahead of it leaves `Converters.Count` unchanged at 9 and the original still registered.
 
 ### 2.3 Operations
 
@@ -337,6 +385,11 @@ Omitted fields take `MediaOptions`' ctor defaults (`MediaOptions.cs:14-20`), whi
 side must replicate. `EnableDirectStream: false` is shown because
 `MediaInfoHelper.cs:248-253` force-clears it unless `ForceDirectStream` is set — a
 server-side override the corpus should mirror for realism, not a StreamBuilder behaviour.
+
+`EncoderPreset` (`MediaBrowser.Model/Entities/EncoderPreset.cs`) has 11 members, verified
+against the compiled enum: `auto=0, placebo=1, veryslow=2, slower=3, slow=4, medium=5,
+fast=6, faster=7, veryfast=8, superfast=9, ultrafast=10`. The protocol accepts the member
+name; `VideosController.cs:485` passes `superfast`. This settles open item 4.
 
 **`encodinghelper.progressive` input:**
 
@@ -492,9 +545,12 @@ synthetic profile is an explicit allowlist, not an open predicate:
 - `SupportsDecoder` — no literals; `:670` and `:6538` pass computed decoder names. The
   synthetic profile therefore needs a **decoder allowlist keyed by the names the decoder
   switch can produce** (`GetHardwareVideoDecoder :6428`, `GetHwaccelType :6587`,
-  `GetQsvHwVidDecoder :6739`). Enumerating that set exactly is **[SDK]** work — the practical
+  `GetQsvHwVidDecoder :6739`). Enumerating that set exactly is still outstanding — the practical
   approach is to instrument the mock to log every argument it is asked about across a full
-  corpus run and freeze the resulting set as the profile.
+  corpus run and freeze the resulting set as the profile. A working
+  `SyntheticMediaEncoder` implementing all 18 members from a declarative capability profile
+  has been built and exercised end-to-end (see §6 Gate 5a); adding the instrumentation is
+  mechanical from there.
 - `SupportsFilterWithOption` — full 9-member `FilterOptionType`
   (`MediaBrowser.Controller/MediaEncoding/FilterOptionType.cs:11-51`).
 - `SupportsBitStreamFilterWithOption` — full 5-member `BitStreamFilterOptionType`
@@ -571,7 +627,28 @@ Resolution — pick one, explicitly, and record it:
 capability profile (§3.5) so that the *assumption is explicit and checkable*, even though the
 oracle reads them ambiently. The harness **asserts at startup** that the real host matches the
 declared values and aborts if not — so a CI runner change surfaces as a loud failure rather
-than a silent behaviour shift. **[SDK] — the startup assertion needs to be compiled and run.**
+than a silent behaviour shift.
+
+**Measured on a representative Linux runner** (`dotnet` 10.0.110, container image used by this
+project):
+
+| Ambient fact | Value |
+|:--|:--|
+| `Environment.OSVersion.Version` | `6.18.5.0` |
+| `RuntimeInformation.OSArchitecture` | `X64` |
+| `OperatingSystem.IsLinux/IsWindows/IsMacOS` | `True/False/False` |
+| `Environment.ProcessorCount` | `4` |
+
+Consequences, both confirmed by execution:
+
+- Kernel `6.18.5` is **outside** the i915 hang window (`5.18 ≤ v ≤ 6.1.3`,
+  `EncodingHelper.cs:69-71`) and **above** `_minKernelVersionAmdVkFmtModifier` (5.15, `:72`).
+  The i915 workaround branches are therefore **permanently uncovered** on this class of
+  runner and belong in `known-uncovered.md`. This settles open item 7.
+- The `-threads` clamp is **live, not theoretical**: `GetNumberOfThreads` returns
+  `0 → 0`, `1 → 1`, `2 → 2`, but `64 → 4` — clamped to `ProcessorCount`. The §3.3(a)
+  mitigation (pin every corpus entry to `0` or `1`) is therefore **required**, not
+  precautionary.
 
 **Flagged for runtime experiment.** `Environment.OSVersion.Version` on Linux returns the
 kernel version. `_minKernelVersionAmdVkFmtModifier = 5.15` (`:72`) and the i915 hang window
@@ -673,6 +750,11 @@ always false under Option A.
 
   "ops": ["streambuilder.video", "encodinghelper.hls"],
 
+  "mediaSourceOverlay": {                 // §2.2(a): [JsonIgnore]d fields, applied post-deserialize
+    "DefaultAudioIndexSource": ["User", "Language"],
+    "TranscodeReasons": []
+  },
+
   "mediaOptions": {                       // MediaOptions overlay; ctor defaults elsewhere
     "AudioStreamIndex": null,
     "SubtitleStreamIndex": 2,
@@ -729,7 +811,7 @@ values — the oracle produces truth (design doc §3) — but they are a ready-m
 interesting `(profile × source)` pairs, and their `TranscodeReason` masks are a useful
 sanity check on the harness itself: if the harness's oracle run disagrees with an
 `[InlineData]` row, the harness is wired wrong, not the port. **That is the harness's own
-first verification gate** (§6, Gate 0). **[SDK] — requires running the upstream test suite.**
+first verification gate** (§6, Gate 0) — **discharged: 663/663 pass.**
 
 The 19 profiles do **not** cover the five client families named in design doc §3 (Swiftfin,
 findroid, Streamyfin, Android TV, Kodi) — only AndroidTVExoPlayer and Yatse are close. §4.4
@@ -929,17 +1011,25 @@ normalization. This matters because `TranscodingUrl` is a wire field
 
 No time estimates. Progress is these gates, in order.
 
-**Gate 0 — harness fidelity.** The C# harness, driven over the ~200 `(profile, source)` pairs
-already enumerated in `StreamBuilderTests.cs`, reproduces every `[InlineData]` row's
-`PlayMethod`, `TranscodeReason` mask, transcode mode, and protocol. This proves the harness
-wires the oracle correctly *before* any Go code exists. **[SDK]**
+**Gate 0 — oracle baseline. DISCHARGED.** `dotnet test tests/Jellyfin.Model.Tests -c Release`
+passes **663/663**, including the ~200 `StreamBuilderTests` `[InlineData]` rows that pin
+`PlayMethod`, the `TranscodeReason` mask, transcode mode, and protocol. The oracle behaves as
+the checked-in expectations claim, so those rows are a valid seed (§4.2) and a valid
+self-check for the harness wiring.
+
+*Build note:* `Directory.Build.props:23-24` attaches the in-tree `Jellyfin.CodeAnalysis`
+analyzer **only in Debug**. A Debug build fails with `CS9057` when the prebuilt analyzer was
+compiled against a newer Roslyn than the installed SDK ships. Building `-c Release` sidesteps
+it with no source change, and is what CI should use.
 
 **Gate 1 — protocol round-trip.** Every corpus input deserializes, serializes, and
-re-deserializes to an identical object graph on the C# side (catches the flag-enum defect of
-§2.2 and any `$type` discriminator gap). **[SDK]**
+re-deserializes to an identical object graph on the C# side. Must cover both defects in §2.2:
+the `[JsonIgnore]` drop (a) and the `Read` throw (b). **Partly discharged** — the (b) fix is
+verified to round-trip byte-identically; the full-corpus sweep remains.
 
 **Gate 2 — host assertion.** The harness aborts on a host whose OS/arch/kernel does not match
-the declared capability profile (§3.3). Verified by deliberately mis-declaring it. **[SDK]**
+the declared capability profile (§3.3). Reference values measured, in §3.3. **[SDK for the
+abort path]**
 
 **Gate 3 — StreamBuilder zero-diff.** Every `streambuilder.*` corpus case produces an
 identical normalized `StreamInfo` from both implementations. Reported per client family, so
@@ -953,6 +1043,54 @@ list is asserted to match — so a branch silently *leaving* coverage is a failu
 
 **Gate 5 — EncodingHelper zero-diff.** Every `encodinghelper.*` corpus case produces an
 identical token list from both implementations, `raw` and `argv` both.
+
+**Gate 5a — argv without media or GPU. DISCHARGED.** The central premise is confirmed
+executable. A `SyntheticMediaEncoder` implementing all 18 `IMediaEncoder` members from a
+declarative capability profile, wired into `EncodingHelper` through its constructor
+(`:161-175`), produces real argv with no ffmpeg binary, no media file, and no GPU:
+
+```
+-i "$MEDIA" -map 0:0 -map 0:1 -map -0:s -codec:v:0 libx264
+-force_key_frames "expr:gte(t,n_forced*5)"
+-vf "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,format=yuv420p"
+-preset veryfast -crf 23
+-x264opts:0 subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0
+-map_metadata -1 -map_chapters -1 -threads 1 -codec:a:0 aac
+-f mp4 -movflags frag_keyframe+empty_moov+delay_moov -y "/OUT.mp4"
+```
+
+Note the `$MEDIA` placeholder arriving via `IMediaEncoder.GetInputPathArgument` exactly as
+§5.1 specifies — injected at the source, not regexed afterwards — and `-threads 1` honouring
+the pinned `CpuCoreLimit`.
+
+**Dead parameter discovered here — add it to the transliteration hazard list.** The argv reads
+`-preset veryfast` although the call passed `EncoderPreset.superfast`. Tracing it:
+`GetVideoQualityParam` (`:2089`) reads `encodingOptions.EncoderPreset` into a local (`:2167`)
+and passes it as `GetEncoderParam`'s nullable `preset` parameter (`:1725`), which resolves
+`preset ?? defaultPreset` (`:1728`). But `EncodingOptions.EncoderPreset` is a **non-nullable**
+enum property that always has a value (`EncodingOptions.cs:221`, defaulted to
+`EncoderPreset.auto` at `:46`), so the `??` can never take its right-hand branch.
+`defaultPreset` — the third parameter of the public entry point
+`GetProgressiveVideoFullCommandLine` — is therefore **unreachable**, and
+`VideosController.cs:485`'s `EncoderPreset.superfast` has no effect whatsoever.
+
+Confirmed across the matrix:
+
+| `EncodingOptions.EncoderPreset` | `defaultPreset` | emitted |
+|:--|:--|:--|
+| `auto` | `superfast` | `-preset veryfast` |
+| `auto` | `placebo` | `-preset veryfast` |
+| `slow` | `superfast` | `-preset slow` |
+| `slow` | `placebo` | `-preset slow` |
+| `ultrafast` | `superfast` | `-preset ultrafast` |
+| `ultrafast` | `placebo` | `-preset ultrafast` |
+
+Two rules for the port, both of the "transliterate, do not redesign" kind:
+`auto` maps to the literal string `veryfast` for libx264/libx265 (`:1731-1735`), and the
+`defaultPreset` argument must be **carried but ignored**. A port that "simplifies" by treating
+`defaultPreset` as the effective fallback diverges the moment a user sets a non-`auto` preset.
+The harness protocol still transmits `defaultPreset` (§2.3) so that the dead parameter stays
+under test rather than being quietly dropped.
 
 **Gate 6 — adversarial paths.** The escaping tier of §5.1 (paths with `:`, `'`, `"`, spaces)
 is zero-diff.
@@ -968,34 +1106,67 @@ Gates 3 and 5 are the ones design doc §4 names as the primary regression guard.
 
 ## 7. Open items
 
-**Needs the SDK to resolve.**
-1. `DynamicHlsController`'s constructor dependency list, and whether reflection into
-   `GetCommandLineArguments` works against a mock-constructed instance (§1.3, option b).
-2. Whether a copy-constructed `JsonSerializerOptions` can displace the
-   `JsonFlagEnumConverterFactory`-produced converter, or whether the factory must be removed
-   from the `Converters` collection and re-added (§2.2).
-3. The closed set of strings ever passed to `IMediaEncoder.SupportsDecoder` (§3.2) — obtained
-   by instrumenting the mock over a full corpus run.
-4. `EncoderPreset`'s member set, to validate `defaultPreset` in the protocol.
-5. Gate 0 in full.
+The .NET SDK is **no longer a blocker.** It installs on Ubuntu 24.04 from Microsoft's apt
+repository (`packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb`, then
+`apt-get install dotnet-sdk-10.0`), which satisfies `global.json`'s `10.0.0 / latestMinor`.
+The `dot.net` and `builds.dotnet.microsoft.com` CDNs are blocked by the agent proxy, so the
+usual `dotnet-install.sh` route fails; the apt route does not. `api.nuget.org` is reachable,
+so restore works. Build with `-c Release` (see Gate 0). Everything below marked RESOLVED was
+settled by execution against `dotnet` 10.0.110.
 
-**Needs a runtime experiment.**
-6. Whether .NET and Go agree on float formatting for every float that reaches argv (§5.1).
-   The most likely place for a silent, systematic diff.
-7. What `Environment.OSVersion.Version` actually returns on the chosen CI runner, and
-   therefore which side of the i915 hang window (`5.18`–`6.1.3`, carve-out `6.0.18`,
-   `EncodingHelper.cs:69-71`) every case falls on. If the runner is outside the window, those
-   branches are permanently uncovered and belong in `known-uncovered.md`.
-8. Whether real clients ever send `ProfileCondition`s with `GreaterThanEqual` — carried over
-   from `03`. If yes, the dead-code skip at `StreamBuilder.cs:1752-1755` is load-bearing and
-   the corpus must contain such a profile. `corpusgen` (§4.4) should count them across
-   captures and report.
-9. Whether `containerSupported` (`StreamBuilder.cs:1323`) — mutated inside a LINQ `Select`
-   forced by `.ToArray()` at `:1398`, read at `:1411` — is fully enumerated in all cases.
-   Also carried over from `03`. The harness can settle it directly: a corpus case with a
-   `DeviceProfile` whose `DirectPlayProfiles` mix container-matching and container-mismatching
-   entries, where the *first* entry mismatches. If the Go port's eager loop and the C# lazy
-   `Select` agree there, the concern is closed.
+**Resolved by execution.**
+1. **RESOLVED — `DynamicHlsController` reflection is viable.** One 11-parameter constructor;
+   9 interfaces plus `DynamicHlsHelper` and `EncodingHelper`.
+   `GetCommandLineArguments` resolves under `NonPublic | Instance` with the expected
+   signature. Full detail in §1.3.
+2. **RESOLVED, and the original diagnosis was wrong.** The blocker on `MediaSourceInfo` is
+   `[JsonIgnore]` (`:118-122`), not the converter — the fields are silently dropped in both
+   directions, which is worse than throwing because it fails green. The `Read` throw is real
+   but lands on `StreamInfo.TranscodeReasons`, the output type. The copy-constructor fix
+   works for the latter provided the factory is **removed** rather than preceded. Rewritten
+   §2.2.
+3. **Still open.** The closed set of strings passed to `IMediaEncoder.SupportsDecoder`. The
+   `SyntheticMediaEncoder` needed to instrument it now exists and runs (Gate 5a); only the
+   logging and a full corpus sweep remain.
+4. **RESOLVED.** `EncoderPreset` has 11 members, listed in §2.3 — *and* the `defaultPreset`
+   parameter it feeds turns out to be unreachable dead code. See the hazard note under
+   Gate 5a.
+5. **RESOLVED.** Gate 0 passes 663/663.
+7. **RESOLVED.** The runner reports kernel `6.18.5.0`, `X64`, `ProcessorCount = 4` — outside
+   the i915 hang window, above the AMD Vulkan modifier threshold. Those branches are
+   permanently uncovered on this runner class. The `-threads` clamp is confirmed live
+   (`CpuCoreLimit=64 → 4`). Table in §3.3.
+9. **RESOLVED — `containerSupported` is fully enumerated, and the suppression is real.**
+   Driving `GetOptimalVideoStream` with a `DeviceProfile` whose first `DirectPlayProfile`
+   mismatches the container and whose second matches, plus a `CodecProfile` width cap that
+   forces `VideoResolutionNotSupported` (outside `DirectStreamReasons`, so every profile
+   returns a null `PlayMethod` and evaluation reaches `:1409`):
+
+   | `DirectPlayProfiles` vs `mkv` source | reported `TranscodeReasons` |
+   |:--|:--|
+   | `[mp4, mkv]` — matched by the second | `VideoResolutionNotSupported` |
+   | `[mp4, webm]` — matched by none | `ContainerNotSupported, VideoResolutionNotSupported` |
+
+   Both returned `PlayMethod = Transcode`, proving the early return at `:1404` did not fire.
+   So the `.ToArray()` at `:1398` does force full enumeration before the read at `:1411`, and
+   a container match anywhere in the list suppresses `ContainerNotSupported` from the
+   explanation. **The Go port may use an eager loop**, provided `containerSupported` is
+   computed across *all* profiles before the reason is selected. The `03` concern is closed.
+
+**Still needs a runtime experiment.**
+6. **Sharpened, not resolved.** .NET's invariant `double.ToString()` was measured across the
+   values likely to reach argv. Ordinary framerates and bitrates are safe — `23.976`,
+   `29.97`, `59.94`, `0.5`, `123456789.123`, and integral values as `25` / `30` / `1000000`
+   (no `.0` suffix) — and Go's `strconv.FormatFloat(v, 'g', -1, 64)` agrees on all of them.
+   The divergence is in **exponent form**: .NET emits `1E-07` and `1E+21` where Go emits
+   `1e-07` and `1e+21` — different case, and Go drops to exponent form at a different
+   magnitude threshold than .NET does. Whether any argv value ever crosses into that range is
+   the remaining question; `GetFramerateParam` (`:1980`) and the bitrate params are the
+   candidates. Until that is settled the Go side should format argv floats with an explicit
+   .NET-compatible routine rather than `%v` or `FormatFloat` defaults.
+8. **Unchanged.** Whether real clients send `ProfileCondition`s with `GreaterThanEqual`,
+   which would make the dead-code skip at `StreamBuilder.cs:1752-1755` load-bearing. Needs
+   captured traffic, not a local run. `corpusgen` (§4.4) should count them.
 
 **Decisions recorded here that the design doc should absorb.**
 10. Design doc §4's named entry points are wrong; §0 above supersedes them.
