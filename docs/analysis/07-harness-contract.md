@@ -1099,6 +1099,22 @@ is zero-diff.
 Linux runner, with no GPU, no ffmpeg binary, and no media files. Wall-clock is bounded by the
 harness being a single long-lived process.
 
+The workflow is drafted at `docs/design/harness-ci/differential.yml`, staged there rather than
+in `.github/workflows/` because it belongs to the **Go** repo — this fork is the read-only
+oracle (design §1) and already carries 15 upstream workflow files that ours would collide with.
+`docs/design/harness-ci/README.md` records the destination path, the CLI contract each binary
+must satisfy, and the gate-to-job mapping.
+
+Two things that workflow settles, both of which correct earlier assumptions:
+
+- **`actions/setup-dotnet`, not the apt route.** The `packages.microsoft.com` procedure in §7
+  is a workaround for *this sandbox's* blocked egress; GitHub runners need none of it.
+- **A pinned container does not pin the kernel.** Containers share the host kernel, so
+  `Environment.OSVersion.Version` still reports the runner's. The host assertion therefore
+  transliterates the oracle's own kernel predicates rather than comparing a version string —
+  including the `6.0.18 ≤ v < 6.1` carve-out at `EncodingHelper.cs:2124-2126`, which a naive
+  `5.18..6.1.3` range check gets wrong and would fail a healthy runner on.
+
 Gates 3 and 5 are the ones design doc §4 names as the primary regression guard. Gates 0–2 and
 4 exist because a harness that is wrong in the same direction as the port proves nothing.
 
