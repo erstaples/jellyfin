@@ -8,12 +8,21 @@
 
 name: differential
 
+# NOTE ON PATH FILTERING: this uses paths-ignore (a denylist), deliberately, not
+# paths (an allowlist). With an allowlist it is easy to forget an entry and
+# silently skip the harness on a change that needed it — and if this workflow is
+# ever a required status check, a skipped run never reports and blocks the PR
+# forever. A denylist fails safe: it only skips when EVERY changed file is docs.
+#
+# The oracle submodule appears to git as a single gitlink path, `oracle`, so a
+# pin bump is an ordinary file change and is NOT ignored here — which is what we
+# want, because Gate 0 and the golden-drift gate exist precisely to catch it.
 on:
   push:
     branches: [master]
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
   pull_request:
-  # Gate 0 must also run when the oracle pin moves, which can happen without
-  # any Go source changing.
+    paths-ignore: ['docs/**', '**/*.md', 'LICENSE']
   workflow_dispatch:
 
 permissions:
@@ -48,6 +57,9 @@ jobs:
   # kernel would break on every runner image bump for no correctness gain.
   # ---------------------------------------------------------------------------
   host-assert:
+    # Guard so a fork of the Go repo does not burn minutes on a harness whose
+    # goldens it has no way to regenerate. Change the value when the repo moves.
+    if: github.repository == 'erstaples/jellyfin-go'
     runs-on: ubuntu-24.04
     outputs:
       kernel: ${{ steps.facts.outputs.kernel }}
