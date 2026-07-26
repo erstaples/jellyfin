@@ -1357,8 +1357,14 @@ request. **Transliterate the skip at `:1753` and keep the ten branches as unreac
 that the port's structure still matches the oracle if the skip is ever removed upstream.
 
 Recommended: implement them, mark them unreachable, and add an assertion that they are never
-entered. The harness should have a corpus case with a `GreaterThanEqual` condition on `Width`
-that fails if the port honours it.
+entered. The harness needs a corpus case that fails if the port honours the operator.
+
+⚠️ **The shipped fixtures do not provide one, and one of them looks like it does.**
+`DeviceProfile-AndroidTVExoPlayer.json` carries two `Width GreaterThanEqual` conditions — but in
+`ApplyConditions`, which reaches `ConditionProcessor` and never reaches this function (`:1080`,
+`:1112` pass `Conditions` only). Treating that fixture as coverage for this hazard is the wrong
+inference. The case must be **synthesized**: a `GreaterThanEqual` in a `CodecProfile.Conditions`,
+`ContainerProfile.Conditions` or `TranscodingProfile.Conditions`. See §9.1.
 
 ### 6.3 Qualified / non-qualified gating
 
@@ -1623,11 +1629,8 @@ Neither affects the wire. Do not "fix" them into behaviour.
 Items that source reading cannot settle. Each needs a probe against a real 10.10-line server
 before the harness corpus can claim coverage.
 
-1. **Do real clients ever send `GreaterThanEqual` conditions?** If the corpus contains none, the
-   dead branches in §6.2 are untestable and the protection is theoretical. If some do — the
-   likely candidates are `VideoBitrate`/`Height` floors in third-party profiles — the skip is
-   directly observable and must be pinned. Probe: enumerate `DeviceProfile` payloads from the
-   Jellyfin web client, Findroid, Infuse, and the DLNA built-in profiles.
+1. ~~**Do real clients ever send `GreaterThanEqual` conditions?**~~ **Partly settled from the
+   shipped corpus — see §9.1 below.** What remains open is only the *application*-side half.
 2. **Do any shipped or common profiles put a non-audio `ProfileConditionValue` inside a
    `CodecProfile` of `Type = Audio`/`VideoAudio`?** That throws (§5.1). Confirm the real server
    returns 500 rather than a handled error, so the port's error behaviour matches.
@@ -1651,6 +1654,56 @@ before the harness corpus can claim coverage.
    `CanEncodeToAudioCodec` are consulted throughout §7 and §4.6 but are **[NOT IN SOURCE]** for
    this document — they live outside `StreamBuilder.cs`/`ConditionProcessor.cs` and need their own
    transliteration pass before the subtitle gates can be verified.
+
+### 9.1 Settled: `GreaterThanEqual` in the shipped corpus
+
+Item 1 above no longer needs a probe for the evaluation half. The oracle's own test fixtures
+answer it, and the answer splits in a way that matters.
+
+**Real clients do send `GreaterThanEqual`.** `tests/Jellyfin.Model.Tests/Test Data/` holds 52
+JSON fixtures, 19 of them real client `DeviceProfile` payloads (Chrome, Firefox, Safari, Roku,
+Tizen, WebOS, AndroidTV ExoPlayer, JellyfinMediaPlayer, Yatse and others). Counting every object
+carrying both a `Condition` and a `Property` key, across all 52 fixtures:
+
+| Operator | Occurrences |
+|:--|--:|
+| `EqualsAny` | 47 |
+| `LessThanEqual` | 42 |
+| `NotEquals` | 30 |
+| `Equals` | 11 |
+| `GreaterThanEqual` | **2** |
+
+Both `GreaterThanEqual` conditions live in `DeviceProfile-AndroidTVExoPlayer.json`, on an `h264`
+`CodecProfile`:
+
+```json
+{ "Condition": "GreaterThanEqual", "Property": "Width", "Value": "1200", "IsRequired": false }
+{ "Condition": "GreaterThanEqual", "Property": "Width", "Value": "1900", "IsRequired": false }
+```
+
+**But both are in `ApplyConditions`, not `Conditions`.** That routes them to the **evaluation**
+path only:
+
+- `ApplyConditions` are evaluated by `ConditionProcessor.IsVideoConditionSatisfied` — at `:1071`,
+  `:1102`, `:1712`, `:1730` and `:2420` — where `GreaterThanEqual` is fully implemented and
+  **required** (`ConditionProcessor.cs:219-221` for `int?`, `:309-311` for `double?`).
+- `ApplyTranscodingConditions` is only ever handed `codecProfile.Conditions` (`:1080`, `:1112`),
+  `transcodingProfile.Conditions` (`:818`) or the audio condition list (`:192`). It never receives
+  `ApplyConditions`.
+
+So:
+
+| Half | Status |
+|:--|:--|
+| **Evaluation-side `GreaterThanEqual`** (`ConditionProcessor`) | **Live, exercised by a real client profile, required.** Must be implemented faithfully and tested against `DeviceProfile-AndroidTVExoPlayer.json`. |
+| **Application-side `GreaterThanEqual`** (the `:1753` skip and its ten dead branches, §6.2 / hazard H17) | **Still unexercised by the shipped corpus.** No fixture routes a `GreaterThanEqual` into `ApplyTranscodingConditions`. |
+
+**Do not let the two get conflated.** Seeing `Width GreaterThanEqual` in the AndroidTV fixture and
+concluding that hazard H17 is covered is exactly the wrong inference — that condition never
+reaches the code the hazard is about. The open probe is now narrower: find (or synthesize) a
+profile that puts a `GreaterThanEqual` in a `CodecProfile.Conditions`, `ContainerProfile.Conditions`
+or `TranscodingProfile.Conditions`, and confirm against the running server that the clamp is
+**not** applied.
 
 ---
 
@@ -1759,7 +1812,10 @@ value is unknown.
 comparison time, parse the condition value as `float64`.
 
 **H17 — the `GreaterThanEqual` whole-loop skip (`:1753`) and its ten unreachable branches.** §6.2.
-The single most likely "cleanup" to break the port.
+The single most likely "cleanup" to break the port. Note that the shipped fixtures do **not**
+cover this hazard even though one of them contains `Width GreaterThanEqual` — that condition sits
+in `ApplyConditions` and reaches `ConditionProcessor`, not `ApplyTranscodingConditions`. The G6
+case must be synthesized. §9.1.
 
 **H18 — `AudioBitDepth` has no arm in `ApplyTranscodingConditions`.** 25 case labels for 26 enum
 members; `AudioBitDepth` falls through to `default` (`:2271`). It *is* handled in the compatibility
